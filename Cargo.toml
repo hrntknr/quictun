@@ -1,0 +1,16 @@
+[package]
+name = "quictun"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+directories = "4.0.1"
+env_logger = "0.10.0"
+log = "0.4.17"
+quinn = "0.9.3"
+rustls = { version = "0.20.8", features = ["dangerous_configuration"] }
+rustls-native-certs = "0.6.2"
+rustls-pemfile = "1.0.2"
+structopt = "0.3.26"
+tokio = { version = "1.26.0", features = ["full"] }
+url = "2.3.1"
