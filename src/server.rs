@@ -4,15 +4,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub async fn server(
-    conn_timeout: u64,
     listen: String,
     auto_generate: String,
     cert: String,
     key: String,
+    root_cert: String,
+    root_key: String,
+    client_cert: String,
+    client_key: String,
+    no_client_auth: bool,
+    conn_timeout: u64,
     target_whitelist: String,
 ) -> Result<()> {
     if auto_generate != "" {
-        crate::util::generate(&auto_generate, &cert, &key).await?;
+        crate::util::generate(
+            no_client_auth,
+            &auto_generate,
+            &cert,
+            &key,
+            &root_cert,
+            &root_key,
+            &client_cert,
+            &client_key,
+        )
+        .await?;
     }
     if !async_std::path::Path::new(&cert).exists().await {
         return Err("cert file not found".into());
@@ -34,10 +49,26 @@ pub async fn server(
     let cert = rustls_pemfile::certs(&mut &*cert).expect("invalid PEM-encoded certificate");
     let cert = cert.into_iter().map(rustls::Certificate).collect();
 
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(cert, key)?;
+    let mut server_config = match no_client_auth {
+        true => rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert, key)?,
+        false => {
+            let root_cert = async_std::fs::read(root_cert).await?;
+            let root_cert = rustls_pemfile::certs(&mut &*root_cert)
+                .expect("invalid PEM-encoded root certificate");
+
+            let mut roots = rustls::RootCertStore::empty();
+            for data in root_cert.into_iter() {
+                roots.add(&rustls::Certificate(data))?;
+            }
+            rustls::ServerConfig::builder()
+                .with_safe_defaults()
+                .with_client_cert_verifier(rustls::server::AllowAnyAuthenticatedClient::new(roots))
+                .with_single_cert(cert, key)?
+        }
+    };
     server_config.alpn_protocols = vec![b"quic/v1".to_vec()];
 
     let mut transport_config = quinn::TransportConfig::default();

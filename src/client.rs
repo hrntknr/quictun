@@ -24,8 +24,11 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
 }
 
 pub async fn client(
-    conn_timeout: u64,
+    client_cert: String,
+    client_key: String,
+    no_client_auth: bool,
     keep_alive: u64,
+    conn_timeout: u64,
     endpoint: String,
     target: String,
 ) -> Result<()> {
@@ -55,14 +58,33 @@ pub async fn client(
     };
     let mut qe = quinn::Endpoint::client(bind_addr.parse()?)?;
 
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs()? {
-        roots.add(&rustls::Certificate(cert.0)).unwrap();
-    }
-    let mut client_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_no_client_auth();
+    let mut client_config = match no_client_auth {
+        true => rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth(),
+        false => {
+            let client_cert = async_std::fs::read(client_cert).await?;
+            let client_cert = rustls_pemfile::certs(&mut &*client_cert)
+                .expect("invalid PEM-encoded root certificate");
+            let client_cert = client_cert.into_iter().map(rustls::Certificate).collect();
+            let client_key = async_std::fs::read(client_key).await?;
+            let client_key = rustls_pemfile::pkcs8_private_keys(&mut &*client_key)
+                .expect("invalid PEM-encoded root private key");
+            let client_key = match client_key.into_iter().next() {
+                Some(x) => rustls::PrivateKey(x),
+                None => {
+                    return Err("no keys found".into());
+                }
+            };
+
+            rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_custom_certificate_verifier(SkipServerVerification::new())
+                // .with_no_client_auth()
+                .with_single_cert(client_cert, client_key)?
+        }
+    };
     client_config.alpn_protocols = vec![b"quic/v1".to_vec()];
 
     let mut transport_config = quinn::TransportConfig::default();
