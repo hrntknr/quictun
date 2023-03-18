@@ -1,4 +1,5 @@
 use async_std::io::{ReadExt, WriteExt};
+use byteorder::ByteOrder;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -118,8 +119,11 @@ async fn handle_stream(
     let mut out: Vec<u8> = Vec::new();
     let target_buf = target.as_bytes();
     out.extend_from_slice(&[0x01]);
+    let mut len = [0u8; 2];
+    byteorder::BigEndian::write_u16(&mut len, target_buf.len() as u16);
+    out.extend_from_slice(&len);
     out.extend_from_slice(target_buf);
-    send.write(&out).await?;
+    send.write_all(&out).await?;
 
     let mut code = 0u32;
     let mut reason = Vec::new();
@@ -127,6 +131,7 @@ async fn handle_stream(
     let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut stdbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut stdin = async_std::io::stdin();
+    let mut read_remain = Vec::new();
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
@@ -135,7 +140,7 @@ async fn handle_stream(
             }
             _ = interval.tick() => {
                 debug!("client: interval tick");
-                match send.write(&[]).await {
+                match send.write_all(&[]).await {
                     Ok(v) => {
                         debug!("client: send: {:?}", v);
                     }
@@ -149,7 +154,7 @@ async fn handle_stream(
             }
             v = recv.read(&mut buf) => {
                 debug!("client: recv: {:?}", v);
-                let v = match v {
+                let mut v = match v {
                     Ok(v) => {
                         if v.is_none() {
                             continue;
@@ -163,11 +168,24 @@ async fn handle_stream(
                         break;
                     }
                 };
-                if v == 0 {
-                    continue;
+                read_remain.extend_from_slice(&buf[..v]);
+                v = read_remain.len() + v;
+                loop {
+                    if 0 == read_remain.len() {
+                        break;
+                    }
+                    if 3 > read_remain.len() {
+                        break;
+                    }
+                    let command = read_remain[0];
+                    let length = byteorder::BigEndian::read_u16(&read_remain[1..3]) as usize;
+                    if 3 + length > read_remain.len() {
+                        break;
+                    }
+                    let payload = &read_remain[3..3 + length];
+                    handle_command(command, payload).await?;
+                    read_remain.drain(..3 + length);
                 }
-                let command = buf[0];
-                handle_command(command, &buf[1..v]).await?;
             }
             v = stdin.read(&mut stdbuf) => {
                 debug!("client: stdin: {:?}", v);
@@ -175,8 +193,11 @@ async fn handle_stream(
                     Ok(v) => {
                         let mut vec = Vec::new();
                         vec.extend_from_slice(&[0x02]);
+                        let mut len = [0u8; 2];
+                        byteorder::BigEndian::write_u16(&mut len, v as u16);
+                        vec.extend_from_slice(&len);
                         vec.extend_from_slice(&stdbuf[..v]);
-                        send.write(&vec).await?;
+                        send.write_all(&vec).await?;
                     }
                     Err(e) => {
                         error!("client: stdin error: {}", e);

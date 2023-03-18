@@ -5,7 +5,7 @@ pub enum Mode {
     SSH,
 }
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_DATAGRAM_SIZE: usize = 0xffff;
 
 mod client;
 mod server;
