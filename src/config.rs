@@ -27,7 +27,7 @@ pub enum Mode {
         client_key: ClientKey,
         #[structopt(long)]
         no_client_auth: bool,
-        #[structopt(long, default_value = "10")]
+        #[structopt(long, default_value = "300")]
         conn_timeout: u64,
         #[structopt(long, default_value = "^.*$")]
         target_whitelist: String,
@@ -39,9 +39,9 @@ pub enum Mode {
         client_key: ClientKey,
         #[structopt(long)]
         no_client_auth: bool,
-        #[structopt(long, default_value = "1")]
-        keep_alive: u64,
         #[structopt(long, default_value = "10")]
+        keep_alive: u64,
+        #[structopt(long, default_value = "300")]
         conn_timeout: u64,
 
         endpoint: String,
