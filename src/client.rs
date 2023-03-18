@@ -1,18 +1,7 @@
+use async_std::io::{ReadExt, WriteExt};
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-struct Packet {
-    stream_id: u64,
-    payload: Vec<u8>,
-}
-
-impl std::fmt::Debug for Packet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Packet")
-            .field("streamId", &self.stream_id)
-            .field("payload", &self.payload)
-            .finish()
-    }
-}
 struct SkipServerVerification;
 impl SkipServerVerification {
     fn new() -> std::sync::Arc<Self> {
@@ -76,7 +65,9 @@ pub async fn client(
     client_config.alpn_protocols = vec![b"quic/v1".to_vec()];
 
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into()?));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(conn_timeout).try_into()?,
+    ));
 
     let mut quinn_client_config = quinn::ClientConfig::new(std::sync::Arc::new(client_config));
     quinn_client_config.transport_config(std::sync::Arc::new(transport_config));
@@ -88,56 +79,134 @@ pub async fn client(
             return Err(format!("failed to connect: {}", e).into());
         }
     };
-
-    let (mut ctrl_send, mut ctrl_recv) = match conn.open_bi().await {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(format!("failed to open stream: {}", e).into());
-        }
-    };
-    let (mut data_send, mut data_recv) = match conn.open_bi().await {
+    let (send, recv) = match conn.open_bi().await {
         Ok(v) => v,
         Err(e) => {
             return Err(format!("failed to open stream: {}", e).into());
         }
     };
 
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
-        let mut buf = [0; crate::MAX_DATAGRAM_SIZE];
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
         loop {
-            match data_recv.read(&mut buf).await {
-                Ok(v) => {
-                    debug!("client: recv: {:?}", v);
-                }
-                Err(e) => {
-                    error!("client: recv: {}", e);
-                    break;
-                }
-            }
+            tokio::select! {
+                _ = sigterm.recv() => println!("Recieve SIGTERM"),
+                _ = sigint.recv() => println!("Recieve SIGTERM"),
+            };
+            stop_tx.send(()).unwrap();
         }
     });
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
-
-        loop {
-            interval.tick().await;
-            debug!("client: send: ping (keep-alive)");
-            let mut out = Vec::new();
-            out.extend_from_slice(b"ping");
-            match ctrl_send.write(&out).await {
-                Ok(v) => {
-                    debug!("client: send: {:?}", v);
-                }
-                Err(e) => {
-                    error!("client: send: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100000)).await;
+    handle_stream(conn, send, recv, target, keep_alive, stop_rx).await?;
+    qe.wait_idle().await;
 
     return Ok(());
+}
+
+async fn handle_stream(
+    conn: quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    target: String,
+    keep_alive: u64,
+    mut stop_rx: tokio::sync::watch::Receiver<()>,
+) -> Result<()> {
+    let mut out: Vec<u8> = Vec::new();
+    let target_buf = target.as_bytes();
+    out.extend_from_slice(&[0x01]);
+    out.extend_from_slice(target_buf);
+    send.write(&out).await?;
+
+    let mut code = 0u32;
+    let mut reason = Vec::new();
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
+    let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
+    let mut stdbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
+    let mut stdin = async_std::io::stdin();
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => {
+                debug!("client: stop_rx changed");
+                break;
+            }
+            _ = interval.tick() => {
+                debug!("client: interval tick");
+                match send.write(&[]).await {
+                    Ok(v) => {
+                        debug!("client: send: {:?}", v);
+                    }
+                    Err(e) => {
+                        error!("client: send error: {}", e);
+                        code = 1;
+                        reason = b"keep alive failed".to_vec();
+                        break;
+                    }
+                }
+            }
+            v = recv.read(&mut buf) => {
+                debug!("client: recv: {:?}", v);
+                match v {
+                    Ok(v) => {
+                        if v.is_none() {
+                            continue;
+                        }
+                        if v.unwrap() < 1 {
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        error!("client: recv error: {}", e);
+                        code = 1;
+                        reason = b"recv failed".to_vec();
+                        break;
+                    }
+                }
+                let command = buf[0];
+                handle_command(&conn, &send, &recv, command, &buf[1..]).await?;
+            }
+            v = stdin.read(&mut stdbuf) => {
+                debug!("client: stdin: {:?}", v);
+                match v {
+                    Ok(v) => {
+                        let mut vec = Vec::new();
+                        vec.extend_from_slice(&[0x02]);
+                        vec.extend_from_slice(&stdbuf[..v]);
+                        send.write(&vec).await?;
+                    }
+                    Err(e) => {
+                        error!("client: stdin error: {}", e);
+                        code = 1;
+                        reason = b"stdin failed".to_vec();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    debug!("closing connection");
+    conn.close(quinn::VarInt::from_u32(code), &reason);
+    return Ok(());
+}
+
+async fn handle_command(
+    mut conn: &quinn::Connection,
+    mut send: &quinn::SendStream,
+    mut recv: &quinn::RecvStream,
+    command: u8,
+    payload: &[u8],
+) -> Result<()> {
+    match command {
+        0x02 => {
+            async_std::io::stdout().write_all(payload).await?;
+            async_std::io::stdout().flush().await?;
+            return Ok(());
+        }
+        _ => {
+            return Ok(());
+        }
+    }
 }

@@ -24,7 +24,7 @@ enum Mode {
         #[structopt(short, long, default_value)]
         key: Key,
     },
-    Client {
+    SSH {
         #[structopt(short, long, default_value = "1")]
         keep_alive: u64,
 
@@ -99,22 +99,26 @@ impl std::fmt::Display for Key {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-
     let args = Args::from_args();
     match args.mode {
-        Mode::Client {
+        Mode::SSH {
             keep_alive,
             endpoint,
             target,
-        } => match quictun::client(args.conn_timeout, keep_alive, endpoint, target).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("client: {}", e);
-                exit(1);
+        } => {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
+                .init();
+            match quictun::client(args.conn_timeout, keep_alive, endpoint, target).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("client: {}", e);
+                    exit(1);
+                }
             }
-        },
+        }
         Mode::Server { listen, cert, key } => {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .init();
             match quictun::server(args.conn_timeout, listen, cert.str, key.str).await {
                 Ok(_) => {}
                 Err(e) => {
