@@ -19,10 +19,14 @@ enum Mode {
     Server {
         #[structopt(short, long, default_value = "[::0]:2222")]
         listen: String,
+        #[structopt(short, long, default_value = "localhost")]
+        auto_generate: String,
         #[structopt(short, long, default_value)]
         cert: Cert,
         #[structopt(short, long, default_value)]
         key: Key,
+        #[structopt(short, long, default_value = "^.*$")]
+        target_whitelist: String,
     },
     SSH {
         #[structopt(short, long, default_value = "1")]
@@ -116,10 +120,25 @@ async fn main() {
                 }
             }
         }
-        Mode::Server { listen, cert, key } => {
+        Mode::Server {
+            listen,
+            auto_generate,
+            cert,
+            key,
+            target_whitelist,
+        } => {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
                 .init();
-            match quictun::server(args.conn_timeout, listen, cert.str, key.str).await {
+            match quictun::server(
+                args.conn_timeout,
+                listen,
+                auto_generate,
+                cert.str,
+                key.str,
+                target_whitelist,
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     error!("server: {}", e);

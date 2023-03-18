@@ -3,8 +3,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String) -> Result<()> {
-    let key = std::fs::read(key)?;
+pub async fn server(
+    conn_timeout: u64,
+    listen: String,
+    auto_generate: String,
+    cert: String,
+    key: String,
+    target_whitelist: String,
+) -> Result<()> {
+    if auto_generate != "" {
+        crate::util::generate(&auto_generate, &cert, &key).await?;
+    }
+    if !async_std::path::Path::new(&cert).exists().await {
+        return Err("cert file not found".into());
+    }
+    if !async_std::path::Path::new(&key).exists().await {
+        return Err("key file not found".into());
+    }
+    let key = async_std::fs::read(key).await?;
     let key =
         rustls_pemfile::pkcs8_private_keys(&mut &*key).expect("malformed PKCS #8 private key");
     let key = match key.into_iter().next() {
@@ -14,7 +30,7 @@ pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String
         }
     };
 
-    let cert = std::fs::read(cert)?;
+    let cert = async_std::fs::read(cert).await?;
     let cert = rustls_pemfile::certs(&mut &*cert).expect("invalid PEM-encoded certificate");
     let cert = cert.into_iter().map(rustls::Certificate).collect();
 
@@ -55,7 +71,7 @@ pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String
         tokio::select! {
             Some(conn) = endpoint.accept() => {
                 debug!("connection incoming");
-                let fut = handle_connection(conn, stop_rx.clone());
+                let fut = handle_connection(target_whitelist.clone() ,conn, stop_rx.clone());
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {
                         error!("connection failed: {reason}", reason = e.to_string())
@@ -73,6 +89,7 @@ pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String
 }
 
 async fn handle_connection(
+    target_whitelist: String,
     conn: quinn::Connecting,
     stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
@@ -97,20 +114,19 @@ async fn handle_connection(
     }
     debug!("ctrl stream established: {}", send.id().index());
 
-    handle_stream(quic_conn, send, recv, stop_rx).await?;
+    handle_stream(target_whitelist, quic_conn, send, recv, stop_rx).await?;
 
     return Ok(());
 }
 
 async fn handle_stream(
+    target_whitelist: String,
     conn: quinn::Connection,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     mut stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
-    let mut code = 0u32;
-    let mut reason = Vec::new();
 
     let mut recv_box = std::boxed::Box::new(recv);
     let send_lock = std::sync::Arc::new(tokio::sync::Mutex::new(send));
@@ -170,7 +186,7 @@ async fn handle_stream(
                         break;
                     }
                     let payload = &read_remain[3..3 + length];
-                    let opt = handle_command(&conn, command, payload, send_lock, &mut upstream_send, close_tx_lock).await?;
+                    let opt = handle_command(target_whitelist.clone(), &conn, command, payload, send_lock, &mut upstream_send, close_tx_lock).await?;
                     if opt.is_some() {
                         upstream_send = opt;
                     }
@@ -180,12 +196,13 @@ async fn handle_stream(
         };
     }
 
-    conn.close(quinn::VarInt::from_u32(code), &reason);
+    conn.close(quinn::VarInt::from_u32(0u32), &[]);
     info!("connection closed: {}", conn.remote_address());
     return Ok(());
 }
 
 async fn handle_command(
+    target_whitelist: String,
     conn: &quinn::Connection,
     command: u8,
     payload: &[u8],
@@ -197,6 +214,10 @@ async fn handle_command(
         0x01 => {
             let target = std::str::from_utf8(payload)?.trim();
             info!("new request {} {}", target, conn.remote_address());
+            if !regex::Regex::new(&target_whitelist)?.is_match(target) {
+                info!("target not allowed: {} {}", target, conn.remote_address());
+                return Err(format!("target not allowed: {}", target).into());
+            }
             let stream = tokio::net::TcpStream::connect(target).await?;
             let (mut read_stream, write_stream) = tokio::io::split(stream);
             info!(
