@@ -145,7 +145,6 @@ async fn handle_stream(
                     }
                 };
                 read_remain.extend_from_slice(&buf[..v]);
-                v = read_remain.len() + v;
                 loop {
                     let close_tx_lock = close_tx_lock.clone();
                     let send_lock = send_lock.clone();

@@ -128,6 +128,8 @@ async fn handle_stream(
     let mut code = 0u32;
     let mut reason = Vec::new();
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
+    debug!("client: keepalive: {:?}", keep_alive);
+    debug!("client: interval: {:?}", interval);
     let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut stdbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut stdin = async_std::io::stdin();
@@ -140,7 +142,7 @@ async fn handle_stream(
             }
             _ = interval.tick() => {
                 debug!("client: interval tick");
-                match send.write_all(&[]).await {
+                match send.write_all(&[0x00,0x00,0x00]).await {
                     Ok(v) => {
                         debug!("client: send: {:?}", v);
                     }
@@ -169,7 +171,6 @@ async fn handle_stream(
                     }
                 };
                 read_remain.extend_from_slice(&buf[..v]);
-                v = read_remain.len() + v;
                 loop {
                     if 0 == read_remain.len() {
                         break;
