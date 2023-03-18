@@ -32,7 +32,7 @@ pub enum Mode {
         #[structopt(long, default_value = "^.*$")]
         target_whitelist: String,
     },
-    SSH {
+    NC {
         #[structopt(long, default_value)]
         client_cert: ClientCert,
         #[structopt(long, default_value)]

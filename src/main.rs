@@ -9,7 +9,7 @@ use structopt::StructOpt;
 async fn main() {
     let args = crate::config::Args::from_args();
     match args.mode {
-        crate::config::Mode::SSH {
+        crate::config::Mode::NC {
             client_cert,
             client_key,
             no_client_auth,

@@ -33,7 +33,7 @@ $ sudo systemctl enable --now quictun
 
 ```
 Host *
-  ProxyCommand quictun ssh --no-client-auth quic://{server_address}:2222 %h:%p
+  ProxyCommand quictun nc --no-client-auth quic://{server_address}:2222 %h:%p
 ```
 
 ## Client Auth
