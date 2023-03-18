@@ -57,13 +57,16 @@ jobs:
           command: build
           args: --release --target ${{ matrix.target }} --verbose
 
+      - name: Rename artifact
+        run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} target/${{ matrix.target }}/release/${{ matrix.target }}
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.target }}
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          files: target/${{ matrix.target }}/release/${{ matrix.target }}
