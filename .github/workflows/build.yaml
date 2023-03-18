@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - '*'
+      - "*"
 
 jobs:
   build:
@@ -48,18 +48,15 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cross build with all features
+      - name: Cross build
         uses: actions-rs/cargo@v1
         with:
-          use-cross: true 
+          use-cross: true
           command: build
           args: --release --target ${{ matrix.target }} --verbose
 
       - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@2.1.1
+        uses: actions/upload-artifact@v3
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          asset_name: ${{ matrix.asset_name }}
-          tag: ${{ github.ref }}
-          overwrite: true
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
