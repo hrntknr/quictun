@@ -87,10 +87,6 @@ async fn handle_connection(
     debug!("waiting for ctrl stream");
     let stream = quic_conn.accept_bi().await;
     let (send, recv) = match stream {
-        Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-            info!("connection closed");
-            return Ok(());
-        }
         Err(e) => {
             return Err(e.into());
         }
@@ -127,6 +123,22 @@ async fn handle_stream(
         let close_tx_lock = close_tx_lock.clone();
         let send_lock = send_lock.clone();
         tokio::select! {
+            e = conn.closed() => {
+                match e {
+                    quinn::ConnectionError::ApplicationClosed { .. } => {
+                        info!("connection closed");
+                        break;
+                    }
+                    quinn::ConnectionError::ConnectionClosed { .. } => {
+                        info!("connection closed");
+                        break;
+                    }
+                    _ => {
+                        warn!("connection closed: {:?}", e);
+                        break;
+                    }
+                }
+            }
             _ = stop_rx.changed() => {
                 break;
             }
@@ -135,13 +147,11 @@ async fn handle_stream(
             }
             v = recv_box.read(&mut buf) => {
                 debug!("client: recv: {:?}", v);
-                let mut v = match v {
+                let v = match v {
                     Ok(v) => {v}
                     Err(e) => {
-                        error!("client: recv error: {}", e);
-                        code = 1;
-                        reason = b"recv failed".to_vec();
-                        break;
+                        debug!("client: recv error: {:?}", e);
+                        continue;
                     }
                 };
                 read_remain.extend_from_slice(&buf[..v]);
@@ -160,7 +170,7 @@ async fn handle_stream(
                         break;
                     }
                     let payload = &read_remain[3..3 + length];
-                    let opt = handle_command(command, payload, send_lock, &mut upstream_send, close_tx_lock).await?;
+                    let opt = handle_command(&conn, command, payload, send_lock, &mut upstream_send, close_tx_lock).await?;
                     if opt.is_some() {
                         upstream_send = opt;
                     }
@@ -170,12 +180,13 @@ async fn handle_stream(
         };
     }
 
-    debug!("closing connection");
     conn.close(quinn::VarInt::from_u32(code), &reason);
+    info!("connection closed: {}", conn.remote_address());
     return Ok(());
 }
 
 async fn handle_command(
+    conn: &quinn::Connection,
     command: u8,
     payload: &[u8],
     send_lock: std::sync::Arc<tokio::sync::Mutex<quinn::SendStream>>,
@@ -185,9 +196,14 @@ async fn handle_command(
     match command {
         0x01 => {
             let target = std::str::from_utf8(payload)?.trim();
-            debug!("connecting to {}", target);
+            info!("new request {} {}", target, conn.remote_address());
             let stream = tokio::net::TcpStream::connect(target).await?;
             let (mut read_stream, write_stream) = tokio::io::split(stream);
+            info!(
+                "connection established upstream {} for {}",
+                target,
+                conn.remote_address()
+            );
             tokio::spawn(async move {
                 let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
                 loop {
@@ -220,7 +236,10 @@ async fn handle_command(
                         }
                     }
                 }
-                close_tx_lock.lock().await.send(()).unwrap();
+                match close_tx_lock.lock().await.send(()) {
+                    Ok(_) => {}
+                    Err(_) => {}
+                };
             });
             return Ok(Some(write_stream));
         }

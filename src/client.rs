@@ -29,7 +29,7 @@ pub async fn client(
     endpoint: String,
     target: String,
 ) -> Result<()> {
-    debug!("client: endpoint: {}, target: {}", endpoint, target);
+    info!("client: endpoint: {}, target: {}", endpoint, target);
 
     let endpoint = url::Url::parse(&endpoint)?;
     if endpoint.scheme() != "quic" {
@@ -136,6 +136,22 @@ async fn handle_stream(
     let mut read_remain = Vec::new();
     loop {
         tokio::select! {
+            e = conn.closed() => {
+                match e {
+                    quinn::ConnectionError::ApplicationClosed { .. } => {
+                        info!("connection closed");
+                        break;
+                    }
+                    quinn::ConnectionError::ConnectionClosed { .. } => {
+                        info!("connection closed");
+                        break;
+                    }
+                    _ => {
+                        warn!("connection closed: {:?}", e);
+                        break;
+                    }
+                }
+            }
             _ = stop_rx.changed() => {
                 debug!("client: stop_rx changed");
                 break;
@@ -156,7 +172,7 @@ async fn handle_stream(
             }
             v = recv.read(&mut buf) => {
                 debug!("client: recv: {:?}", v);
-                let mut v = match v {
+                let v = match v {
                     Ok(v) => {
                         if v.is_none() {
                             continue;
@@ -164,10 +180,8 @@ async fn handle_stream(
                         v.unwrap()
                     }
                     Err(e) => {
-                        error!("client: recv error: {}", e);
-                        code = 1;
-                        reason = b"recv failed".to_vec();
-                        break;
+                        debug!("client: recv error: {:?}", e);
+                        continue;
                     }
                 };
                 read_remain.extend_from_slice(&buf[..v]);
