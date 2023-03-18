@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     name: Release binary
+    permissions: write-all
     strategy:
       matrix:
         include:
@@ -61,6 +62,7 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
       - name: Release
         uses: softprops/action-gh-release@v1
         with:

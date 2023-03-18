@@ -1,6 +1,6 @@
 [package]
 name = "quictun"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 [dependencies]
@@ -18,3 +18,10 @@ rustls-pemfile = "1.0.2"
 structopt = "0.3.26"
 tokio = { version = "1.26.0", features = ["full"] }
 url = "2.3.1"
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
