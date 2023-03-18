@@ -1,3 +1,5 @@
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String) -> Result<()> {
@@ -71,7 +73,7 @@ pub async fn server(conn_timeout: u64, listen: String, cert: String, key: String
 
 async fn handle_connection(
     conn: quinn::Connecting,
-    mut stop_rx: tokio::sync::watch::Receiver<()>,
+    stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let quic_conn = match conn.await {
         Ok(v) => v,
@@ -104,40 +106,95 @@ async fn handle_connection(
 }
 
 async fn handle_stream(
-    mut conn: quinn::Connection,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
     mut stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut code = 0u32;
     let mut reason = Vec::new();
 
+    let mut recv_box = std::boxed::Box::new(recv);
+    let send_lock = std::sync::Arc::new(tokio::sync::Mutex::new(send));
+    let mut upstream_send: Option<tokio::io::WriteHalf<tokio::net::TcpStream>> = None;
+
+    let (upstream_close_tx, mut upstream_close_rx) = tokio::sync::watch::channel(());
+    let close_tx_lock = std::sync::Arc::new(tokio::sync::Mutex::new(upstream_close_tx));
     loop {
+        let close_tx_lock = close_tx_lock.clone();
+        let send_lock = send_lock.clone();
         tokio::select! {
             _ = stop_rx.changed() => {
                 break;
             }
-            v = recv.read(&mut buf) => {
+            _ = upstream_close_rx.changed() => {
+                break;
+            }
+            v = recv_box.read(&mut buf) => {
                 debug!("client: recv: {:?}", v);
-                match v {
-                    Ok(v) => {
-                        if v.is_none() {
-                            break;
-                        }
-                        if v.unwrap() < 1 {
-                            continue;
-                        }
-                    }
+                let v = match v {
+                    Ok(v) => {v}
                     Err(e) => {
                         error!("client: recv error: {}", e);
                         code = 1;
                         reason = b"recv failed".to_vec();
                         break;
                     }
+                };
+                if v == 0 {
+                    continue;
                 }
                 let command = buf[0];
-                handle_command(&conn, &send, &recv, command, &buf[1..]).await?;
+                let payload = &buf[1..v];
+                match command {
+                    0x01 => {
+                        let target = std::str::from_utf8(payload)?.trim();
+                        debug!("connecting to {}", target);
+                        let stream = tokio::net::TcpStream::connect(target).await?;
+                        let (mut read_stream, write_stream) = tokio::io::split(stream);
+                        upstream_send = Some(write_stream);
+                        tokio::spawn(async move{
+                            let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
+                            loop {
+                                let v = read_stream.read(&mut buf).await;
+                                debug!("upstream: recv: {:?}", v);
+                                let v = match v {
+                                    Ok(v) => {v}
+                                    Err(e) => {
+                                        error!("upstream: recv error: {}", e);
+                                        break;
+                                    }
+                                };
+                                if v == 0 {
+                                    break;
+                                }
+                                {
+                                    let mut send_lock = send_lock.lock().await;
+                                    let mut vec = Vec::new();
+                                    vec.extend_from_slice(&[0x02]);
+                                    vec.extend_from_slice(&buf[..v]);
+                                    match send_lock.write(&vec).await {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            error!("upstream: send error: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            close_tx_lock.lock().await.send(()).unwrap();
+                        });
+                    }
+                    0x02 => {
+                        let upstream_send_mut = &mut upstream_send;
+                        if ! upstream_send_mut.is_none(){
+                            upstream_send_mut.as_mut().unwrap().write(payload).await?;
+                        }
+                    }
+                    _ => {
+                    }
+                };
             }
         };
     }
@@ -145,22 +202,4 @@ async fn handle_stream(
     debug!("closing connection");
     conn.close(quinn::VarInt::from_u32(code), &reason);
     return Ok(());
-}
-
-async fn handle_command(
-    mut conn: &quinn::Connection,
-    mut send: &quinn::SendStream,
-    mut recv: &quinn::RecvStream,
-    command: u8,
-    payload: &[u8],
-) -> Result<()> {
-    match command {
-        0x01 => {
-            let target = std::str::from_utf8(payload)?;
-            return Ok(());
-        }
-        _ => {
-            return Ok(());
-        }
-    }
 }

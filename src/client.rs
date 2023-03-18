@@ -149,14 +149,12 @@ async fn handle_stream(
             }
             v = recv.read(&mut buf) => {
                 debug!("client: recv: {:?}", v);
-                match v {
+                let v = match v {
                     Ok(v) => {
                         if v.is_none() {
                             continue;
                         }
-                        if v.unwrap() < 1 {
-                            continue;
-                        }
+                        v.unwrap()
                     }
                     Err(e) => {
                         error!("client: recv error: {}", e);
@@ -164,9 +162,12 @@ async fn handle_stream(
                         reason = b"recv failed".to_vec();
                         break;
                     }
+                };
+                if v == 0 {
+                    continue;
                 }
                 let command = buf[0];
-                handle_command(&conn, &send, &recv, command, &buf[1..]).await?;
+                handle_command(command, &buf[1..v]).await?;
             }
             v = stdin.read(&mut stdbuf) => {
                 debug!("client: stdin: {:?}", v);
@@ -192,13 +193,7 @@ async fn handle_stream(
     return Ok(());
 }
 
-async fn handle_command(
-    mut conn: &quinn::Connection,
-    mut send: &quinn::SendStream,
-    mut recv: &quinn::RecvStream,
-    command: u8,
-    payload: &[u8],
-) -> Result<()> {
+async fn handle_command(command: u8, payload: &[u8]) -> Result<()> {
     match command {
         0x02 => {
             async_std::io::stdout().write_all(payload).await?;
