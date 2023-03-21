@@ -153,12 +153,10 @@ async fn handle_stream_nc(
     let mut out: Vec<u8> = Vec::new();
     let target_buf = target.as_bytes();
     out.extend_from_slice(&[0x01]);
-    let mut len = [0, 0];
-    // let mut len = [0u8; 2];
+    let mut len = [0u8; 2];
     byteorder::BigEndian::write_u16(&mut len, target_buf.len() as u16 + 8);
     out.extend_from_slice(&len);
-    let mut stream_id_buf = [0, 0, 0, 0, 0, 0, 0, 0];
-    // let mut stream_id_buf = [0u8; 8];
+    let mut stream_id_buf = [0u8; 8];
     byteorder::BigEndian::write_u64(&mut stream_id_buf, stream_id);
     out.extend_from_slice(&stream_id_buf);
     out.extend_from_slice(target_buf);
