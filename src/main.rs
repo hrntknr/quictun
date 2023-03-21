@@ -28,6 +28,37 @@ async fn main() {
                 conn_timeout,
                 endpoint,
                 target,
+                quictun::Mode::NC,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("client: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        crate::config::Mode::Client {
+            client_cert,
+            client_key,
+            no_client_auth,
+            keep_alive,
+            conn_timeout,
+            endpoint,
+            target,
+        } => {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .init();
+            match quictun::client(
+                client_cert.str,
+                client_key.str,
+                no_client_auth,
+                keep_alive,
+                conn_timeout,
+                endpoint,
+                target,
+                quictun::Mode::Client,
             )
             .await
             {

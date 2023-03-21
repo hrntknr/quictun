@@ -1,4 +1,6 @@
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use anyhow::{anyhow, Result};
+use async_std::io::{ReadExt, WriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn generate(
     no_client_auth: bool,
@@ -32,14 +34,14 @@ async fn generate_server(hostname: &String, cert: &String, key: &String) -> Resu
     async_std::fs::create_dir_all(match cert_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of cert file".into());
+            return Err(anyhow!("failed to get parent directory of cert file"));
         }
     })
     .await?;
     async_std::fs::create_dir_all(match key_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of key file".into());
+            return Err(anyhow!("failed to get parent directory of key file"));
         }
     })
     .await?;
@@ -88,28 +90,30 @@ async fn generate_root(
     async_std::fs::create_dir_all(match root_cert_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of root cert file".into());
+            return Err(anyhow!("failed to get parent directory of root cert file"));
         }
     })
     .await?;
     async_std::fs::create_dir_all(match root_key_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of root key file".into());
+            return Err(anyhow!("failed to get parent directory of root key file"));
         }
     })
     .await?;
     async_std::fs::create_dir_all(match client_cert_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of client cert file".into());
+            return Err(anyhow!(
+                "failed to get parent directory of client cert file"
+            ));
         }
     })
     .await?;
     async_std::fs::create_dir_all(match client_key_path.parent() {
         Some(x) => x,
         None => {
-            return Err("failed to get parent directory of client key file".into());
+            return Err(anyhow!("failed to get parent directory of client key file"));
         }
     })
     .await?;
@@ -140,5 +144,122 @@ async fn generate_root(
     .await?;
     async_std::fs::write(client_key_path, client_cert.serialize_private_key_pem()).await?;
 
+    return Ok(());
+}
+
+pub async fn pipe_stream_std(
+    conn: &quinn::Connection,
+    quicread: &mut quinn::RecvStream,
+    quicwrite: &mut quinn::SendStream,
+    baseread: &mut async_std::io::Stdin,
+    basewrite: &mut async_std::io::Stdout,
+    stop_rx: &mut tokio::sync::watch::Receiver<()>,
+    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+) -> Result<()> {
+    let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
+    let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
+
+    loop {
+        tokio::select! {
+            _ = conn.closed() => {
+                debug!("pipe_stream: conn closed");
+                break;
+            }
+            _ = stop_rx.changed() => {
+                debug!("pipe_stream: stop_rx changed");
+                break;
+            }
+            v = quicread.read(&mut quicbuf) => {
+                let v = match v {
+                    Ok(None) => continue,
+                    Ok(Some(v)) => {
+                        if v == 0 {
+                            debug!("pipe_stream: quicread EOF");
+                            on_err_tx.send(anyhow!("EOF")).await?;
+                            break;
+                        }
+                        v
+                    },
+                    Err(e) => {
+                        debug!("pipe_stream: quicrecv error: {:?}", e);
+                        on_err_tx.send(e.into()).await?;
+                        break;
+                    }
+                };
+                basewrite.write_all(&quicbuf[..v]).await?;
+                basewrite.flush().await?;
+            },
+
+            v = baseread.read(&mut basebuf) => {
+                let v = match v {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!("pipe_stream: baserecv error: {:?}", e);
+                        on_err_tx.send(e.into()).await?;
+                        break;
+                    }
+                };
+                quicwrite.write_all(&basebuf[..v]).await?;
+            }
+        }
+    }
+    return Ok(());
+}
+
+pub async fn pipe_stream_tcp(
+    conn: &quinn::Connection,
+    quicread: &mut quinn::RecvStream,
+    quicwrite: &mut quinn::SendStream,
+    baseread: &mut tokio::io::ReadHalf<tokio::net::TcpStream>,
+    basewrite: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
+    stop_rx: &mut tokio::sync::watch::Receiver<()>,
+    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+) -> Result<()> {
+    let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
+    let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
+
+    loop {
+        tokio::select! {
+            _ = conn.closed() => {
+                debug!("pipe_stream: conn closed");
+                break;
+            }
+            _ = stop_rx.changed() => {
+                debug!("pipe_stream: stop_rx changed");
+                break;
+            }
+            v = quicread.read(&mut quicbuf) => {
+                let v = match v {
+                    Ok(None) => continue,
+                    Ok(Some(v)) => v,
+                    Err(e) => {
+                        debug!("pipe_stream: quicrecv error: {:?}", e);
+                        on_err_tx.send(e.into()).await?;
+                        break;
+                    }
+                };
+                basewrite.write_all(&quicbuf[..v]).await?
+            },
+
+            v = baseread.read(&mut basebuf) => {
+                let v = match v {
+                    Ok(v) => {
+                        if v == 0 {
+                            debug!("pipe_stream: baserecv EOF");
+                            on_err_tx.send(anyhow!("EOF")).await?;
+                            break;
+                        }
+                        v
+                    },
+                    Err(e) => {
+                        debug!("pipe_stream: baserecv error: {:?}", e);
+                        on_err_tx.send(e.into()).await?;
+                        break;
+                    }
+                };
+                quicwrite.write_all(&basebuf[..v]).await?;
+            }
+        }
+    }
     return Ok(());
 }

@@ -1,7 +1,5 @@
-use async_std::io::{ReadExt, WriteExt};
+use anyhow::{anyhow, Result};
 use byteorder::ByteOrder;
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 struct SkipServerVerification;
 impl SkipServerVerification {
@@ -31,25 +29,25 @@ pub async fn client(
     conn_timeout: u64,
     endpoint: String,
     target: String,
+    mode: crate::Mode,
 ) -> Result<()> {
     info!("client: endpoint: {}, target: {}", endpoint, target);
 
     let endpoint = url::Url::parse(&endpoint)?;
     if endpoint.scheme() != "quic" {
-        return Err("invalid scheme, expected quic://".into());
+        return Err(anyhow!("Length must be less than 10"));
     }
 
     let peer_addr = match std::net::ToSocketAddrs::to_socket_addrs(&format!(
         "{}:{}",
         endpoint.host_str().unwrap(),
         endpoint.port().unwrap()
-    ))
-    .unwrap()
+    ))?
     .next()
     {
         Some(v) => v,
         None => {
-            return Err("failed to resolve peer address".into());
+            return Err(anyhow!("failed to resolve peer address"));
         }
     };
     let bind_addr = match peer_addr {
@@ -65,23 +63,19 @@ pub async fn client(
             .with_no_client_auth(),
         false => {
             let client_cert = async_std::fs::read(client_cert).await?;
-            let client_cert = rustls_pemfile::certs(&mut &*client_cert)
-                .expect("invalid PEM-encoded root certificate");
+            let client_cert = rustls_pemfile::certs(&mut &*client_cert)?;
             let client_cert = client_cert.into_iter().map(rustls::Certificate).collect();
             let client_key = async_std::fs::read(client_key).await?;
-            let client_key = rustls_pemfile::pkcs8_private_keys(&mut &*client_key)
-                .expect("invalid PEM-encoded root private key");
+            let client_key = rustls_pemfile::pkcs8_private_keys(&mut &*client_key)?;
             let client_key = match client_key.into_iter().next() {
                 Some(x) => rustls::PrivateKey(x),
                 None => {
-                    return Err("no keys found".into());
+                    return Err(anyhow!("no keys found"));
                 }
             };
-
             rustls::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_custom_certificate_verifier(SkipServerVerification::new())
-                // .with_no_client_auth()
                 .with_single_cert(client_cert, client_key)?
         }
     };
@@ -99,15 +93,16 @@ pub async fn client(
     let conn = match qe.connect(peer_addr, endpoint.domain().unwrap())?.await {
         Ok(v) => v,
         Err(e) => {
-            return Err(format!("failed to connect: {}", e).into());
+            return Err(anyhow!("failed to connect: {}", e));
         }
     };
-    let (send, recv) = match conn.open_bi().await {
+    let (write, read) = match conn.open_bi().await {
         Ok(v) => v,
         Err(e) => {
-            return Err(format!("failed to open stream: {}", e).into());
+            return Err(anyhow!("failed to open stream: {}", e));
         }
     };
+    debug!("ctrl stream opened: {}", read.id().index());
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
@@ -124,63 +119,88 @@ pub async fn client(
         }
     });
 
-    handle_stream(conn, send, recv, target, keep_alive, stop_rx).await?;
+    match mode {
+        crate::Mode::Client => {
+            handle_stream_client(&conn, read, write, target, keep_alive, stop_rx).await?
+        }
+        crate::Mode::NC => {
+            handle_stream_nc(&conn, read, write, target, keep_alive, stop_rx).await?
+        }
+    };
+
     qe.wait_idle().await;
 
     return Ok(());
 }
 
-async fn handle_stream(
-    conn: quinn::Connection,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+async fn handle_stream_nc(
+    conn: &quinn::Connection,
+    _ctrl_read: quinn::RecvStream,
+    mut ctrl_write: quinn::SendStream,
     target: String,
     keep_alive: u64,
     mut stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
+    let (mut data_write, mut data_read) = conn.open_bi().await?;
+    data_write.write(b"").await?;
+
+    let stream_id = data_read.id().index();
+    debug!("data stream opened: {}", stream_id);
+
+    let conn_clone = conn.clone();
+
+    debug!("start stream: {}", stream_id);
     let mut out: Vec<u8> = Vec::new();
     let target_buf = target.as_bytes();
     out.extend_from_slice(&[0x01]);
-    let mut len = [0u8; 2];
-    byteorder::BigEndian::write_u16(&mut len, target_buf.len() as u16);
+    let mut len = [0, 0];
+    // let mut len = [0u8; 2];
+    byteorder::BigEndian::write_u16(&mut len, target_buf.len() as u16 + 8);
     out.extend_from_slice(&len);
+    let mut stream_id_buf = [0, 0, 0, 0, 0, 0, 0, 0];
+    // let mut stream_id_buf = [0u8; 8];
+    byteorder::BigEndian::write_u64(&mut stream_id_buf, stream_id);
+    out.extend_from_slice(&stream_id_buf);
     out.extend_from_slice(target_buf);
-    send.write_all(&out).await?;
+    ctrl_write.write_all(&out).await.unwrap();
 
     let mut code = 0u32;
     let mut reason = Vec::new();
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
-    debug!("client: keepalive: {:?}", keep_alive);
-    debug!("client: interval: {:?}", interval);
-    let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
-    let mut stdbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut stdin = async_std::io::stdin();
-    let mut read_remain = Vec::new();
+    let mut stdout = async_std::io::stdout();
+    let (on_err_tx, mut on_err_rx) = tokio::sync::mpsc::channel(1);
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
     loop {
         tokio::select! {
-            e = conn.closed() => {
-                match e {
-                    quinn::ConnectionError::ApplicationClosed { .. } => {
-                        info!("connection closed");
+            _ = on_err_rx.recv() => {
+                code = 1;
+                reason = b"on_err".to_vec();
+                break;
+            }
+            v = crate::util::pipe_stream_std(
+                &conn_clone,
+                &mut data_read,
+                &mut data_write,
+                &mut stdin,
+                &mut stdout,
+                &mut stop_rx,
+                on_err_tx.clone(),
+            ) => {
+                debug!("pipe_stream_std: {:?}", v);
+                match v {
+                    Ok(_) => {
                         break;
                     }
-                    quinn::ConnectionError::ConnectionClosed { .. } => {
-                        info!("connection closed");
-                        break;
-                    }
-                    _ => {
-                        warn!("connection closed: {:?}", e);
+                    Err(e) => {
+                        code = 1;
+                        reason = e.to_string().into_bytes();
                         break;
                     }
                 }
             }
-            _ = stop_rx.changed() => {
-                debug!("client: stop_rx changed");
-                break;
-            }
             _ = interval.tick() => {
                 debug!("client: interval tick");
-                match send.write_all(&[0x00,0x00,0x00]).await {
+                match ctrl_write.write_all(&[0x00,0x00,0x00]).await {
                     Ok(v) => {
                         debug!("client: send: {:?}", v);
                     }
@@ -192,74 +212,21 @@ async fn handle_stream(
                     }
                 }
             }
-            v = recv.read(&mut buf) => {
-                debug!("client: recv: {:?}", v);
-                let v = match v {
-                    Ok(v) => {
-                        if v.is_none() {
-                            continue;
-                        }
-                        v.unwrap()
-                    }
-                    Err(e) => {
-                        debug!("client: recv error: {:?}", e);
-                        continue;
-                    }
-                };
-                read_remain.extend_from_slice(&buf[..v]);
-                loop {
-                    if 0 == read_remain.len() {
-                        break;
-                    }
-                    if 3 > read_remain.len() {
-                        break;
-                    }
-                    let command = read_remain[0];
-                    let length = byteorder::BigEndian::read_u16(&read_remain[1..3]) as usize;
-                    if 3 + length > read_remain.len() {
-                        break;
-                    }
-                    let payload = &read_remain[3..3 + length];
-                    handle_command(command, payload).await?;
-                    read_remain.drain(..3 + length);
-                }
-            }
-            v = stdin.read(&mut stdbuf) => {
-                debug!("client: stdin: {:?}", v);
-                match v {
-                    Ok(v) => {
-                        let mut vec = Vec::new();
-                        vec.extend_from_slice(&[0x02]);
-                        let mut len = [0u8; 2];
-                        byteorder::BigEndian::write_u16(&mut len, v as u16);
-                        vec.extend_from_slice(&len);
-                        vec.extend_from_slice(&stdbuf[..v]);
-                        send.write_all(&vec).await?;
-                    }
-                    Err(e) => {
-                        error!("client: stdin error: {}", e);
-                        code = 1;
-                        reason = b"stdin failed".to_vec();
-                        break;
-                    }
-                }
-            }
         }
     }
+
     debug!("closing connection");
     conn.close(quinn::VarInt::from_u32(code), &reason);
     return Ok(());
 }
 
-async fn handle_command(command: u8, payload: &[u8]) -> Result<()> {
-    match command {
-        0x02 => {
-            async_std::io::stdout().write_all(payload).await?;
-            async_std::io::stdout().flush().await?;
-            return Ok(());
-        }
-        _ => {
-            return Ok(());
-        }
-    }
+async fn handle_stream_client(
+    _conn: &quinn::Connection,
+    mut _recv: quinn::RecvStream,
+    mut _send: quinn::SendStream,
+    _target: String,
+    _keep_alive: u64,
+    mut _stop_rx: tokio::sync::watch::Receiver<()>,
+) -> Result<()> {
+    return Ok(());
 }
