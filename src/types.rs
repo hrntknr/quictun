@@ -26,7 +26,7 @@ impl std::str::FromStr for PortAddress {
         };
         Ok(Self {
             port,
-            address: address.to_string(),
+            address: address[1..].to_string(),
         })
     }
 }
