@@ -92,12 +92,17 @@ pub async fn server(
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
         let mut sigint =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let mut force = false;
         loop {
             tokio::select! {
                 _ = sigterm.recv() => println!("Recieve SIGTERM"),
                 _ = sigint.recv() => println!("Recieve SIGTERM"),
             };
+            if force {
+                std::process::exit(1);
+            }
             stop_tx.send(()).unwrap();
+            force = true;
         }
     });
 
@@ -114,23 +119,13 @@ pub async fn server(
                 };
                 let stop_rx_clone = stop_rx.clone();
                 let target_whitelist_clone = target_whitelist.clone();
-                let (on_err_tx, mut on_err_rx) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(async move {
-                    tokio::select! {
-                        e = on_err_rx.recv() => {
-                            let str = format!("{}", e.unwrap());
-                            debug!("on_err_rx: {}", str);
-                            conn.close(quinn::VarInt::from_u32(1u32), str.as_bytes());
+                    match handle_connection(target_whitelist_clone ,&conn, stop_rx_clone.clone()).await {
+                        Ok(_) => {
+                            conn.close(quinn::VarInt::from_u32(0u32), b"");
                         }
-                        v = handle_connection(target_whitelist_clone ,&conn, stop_rx_clone.clone(), on_err_tx.clone()) => {
-                            match v {
-                                Ok(_) => {
-                                    conn.close(quinn::VarInt::from_u32(0u32), b"");
-                                }
-                                Err(e) => {
-                                    conn.close(quinn::VarInt::from_u32(1u32), format!("{}", e).as_bytes());
-                                }
-                            }
+                        Err(e) => {
+                            conn.close(quinn::VarInt::from_u32(1u32), format!("{}", e).as_bytes());
                         }
                     }
                 });
@@ -153,14 +148,20 @@ async fn handle_connection(
     target_whitelist: String,
     conn: &quinn::Connection,
     stop_rx: tokio::sync::watch::Receiver<()>,
-    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
 ) -> Result<()> {
     info!("connection established: {:?}", conn.remote_address());
     let streams = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let mut stop_rx_clone = stop_rx.clone();
+    let (on_err_tx, mut on_err_rx) = tokio::sync::mpsc::channel(1);
     loop {
         tokio::select! {
             _ = stop_rx_clone.changed() => {
+                break;
+            }
+            e = on_err_rx.recv() => {
+                let str = format!("{}", e.unwrap());
+                debug!("on_err_rx: {}", str);
+                // conn.close(quinn::VarInt::from_u32(1u32), str.as_bytes());
                 break;
             }
             stream = conn.accept_bi() => {
@@ -179,7 +180,7 @@ async fn handle_connection(
                         let target_whitelist_clone = target_whitelist.clone();
                         let conn_clone = conn.clone();
                         tokio::spawn(async move {
-                            match handle_ctrl_stream(target_whitelist_clone, &conn_clone,read, write, stream_clone, stop_rx_clone, on_err_tx_clone.clone()).await {
+                            match handle_ctrl_stream(target_whitelist_clone, &conn_clone, read, write, stream_clone, stop_rx_clone, on_err_tx_clone.clone()).await {
                                 Ok(_) => {},
                                 Err(e) => {
                                     let _ = on_err_tx_clone.try_send(e);
@@ -204,8 +205,8 @@ async fn handle_connection(
 async fn handle_ctrl_stream(
     target_whitelist: String,
     conn: &quinn::Connection,
-    mut read: quinn::RecvStream,
-    _write: quinn::SendStream,
+    mut ctrl_read: quinn::RecvStream,
+    mut ctrl_write: quinn::SendStream,
     streams: Streams,
     stop_rx: tokio::sync::watch::Receiver<()>,
     on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
@@ -219,7 +220,7 @@ async fn handle_ctrl_stream(
             _ = stop_rx_clone.changed() => {
                 break;
             }
-            r = read.read(&mut buf) => {
+            r = ctrl_read.read(&mut buf) => {
                 match r {
                     Err(e) => {
                         return Err(anyhow!("failed to read from ctrl stream: {}", e));
@@ -243,7 +244,7 @@ async fn handle_ctrl_stream(
                             }
                             let payload = &read_remain[3..3 + length];
 
-                            handle_command(conn,target_whitelist.clone(), command, payload, streams.clone(), stop_rx.clone(), on_err_tx.clone()).await?;
+                            handle_command(conn,target_whitelist.clone(), command, payload, streams.clone(), &mut ctrl_write, stop_rx.clone(), on_err_tx.clone()).await?;
 
                             read_remain.drain(..3 + length);
                         }
@@ -262,6 +263,7 @@ async fn handle_command(
     command: u8,
     payload: &[u8],
     streams: Streams,
+    ctrl_write: &mut quinn::SendStream,
     mut stop_rx: tokio::sync::watch::Receiver<()>,
     on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
 ) -> Result<()> {
@@ -281,7 +283,20 @@ async fn handle_command(
                 return Err(anyhow!("target not allowed: {}", target));
             }
 
-            let tcp_stream = tokio::net::TcpStream::connect(target).await?;
+            let tcp_stream = match tokio::net::TcpStream::connect(target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("failed to connect to target: {}", e.to_string());
+                    crate::util::ctrl_write_bytes_with_stream(
+                        0x02,
+                        ctrl_write,
+                        stream_id,
+                        target.as_bytes(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
             let conn_clone = conn.clone();
             tokio::spawn(async move {
@@ -293,7 +308,6 @@ async fn handle_command(
                         return;
                     }
                 };
-
                 match crate::util::pipe_stream_tcp(
                     &conn_clone,
                     quic_read,
@@ -301,7 +315,6 @@ async fn handle_command(
                     &mut tcp_read,
                     &mut tcp_write,
                     &mut stop_rx,
-                    on_err_tx.clone(),
                 )
                 .await
                 {
@@ -312,6 +325,10 @@ async fn handle_command(
                 };
             });
 
+            return Ok(());
+        }
+        0x02 => {
+            debug!("close stream!!!!!!");
             return Ok(());
         }
         _ => {

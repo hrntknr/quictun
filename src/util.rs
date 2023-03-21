@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_std::io::{ReadExt, WriteExt};
+use byteorder::ByteOrder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn generate(
@@ -154,7 +155,6 @@ pub async fn pipe_stream_std(
     baseread: &mut async_std::io::Stdin,
     basewrite: &mut async_std::io::Stdout,
     stop_rx: &mut tokio::sync::watch::Receiver<()>,
-    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
 ) -> Result<()> {
     let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
@@ -175,15 +175,13 @@ pub async fn pipe_stream_std(
                     Ok(Some(v)) => {
                         if v == 0 {
                             debug!("pipe_stream: quicread EOF");
-                            on_err_tx.send(anyhow!("EOF")).await?;
-                            break;
+                            return Ok(());
                         }
                         v
                     },
                     Err(e) => {
                         debug!("pipe_stream: quicrecv error: {:?}", e);
-                        on_err_tx.send(e.into()).await?;
-                        break;
+                        return Err(e.into());
                     }
                 };
                 basewrite.write_all(&quicbuf[..v]).await?;
@@ -192,11 +190,16 @@ pub async fn pipe_stream_std(
 
             v = baseread.read(&mut basebuf) => {
                 let v = match v {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        if v == 0 {
+                            debug!("pipe_stream: baseread EOF");
+                            return Ok(());
+                        }
+                        v
+                    },
                     Err(e) => {
                         debug!("pipe_stream: baserecv error: {:?}", e);
-                        on_err_tx.send(e.into()).await?;
-                        break;
+                        return Err(e.into());
                     }
                 };
                 quicwrite.write_all(&basebuf[..v]).await?;
@@ -213,7 +216,6 @@ pub async fn pipe_stream_tcp(
     baseread: &mut tokio::io::ReadHalf<tokio::net::TcpStream>,
     basewrite: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
     stop_rx: &mut tokio::sync::watch::Receiver<()>,
-    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
 ) -> Result<()> {
     let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
@@ -231,11 +233,16 @@ pub async fn pipe_stream_tcp(
             v = quicread.read(&mut quicbuf) => {
                 let v = match v {
                     Ok(None) => continue,
-                    Ok(Some(v)) => v,
+                    Ok(Some(v)) => {
+                        if v == 0 {
+                            debug!("pipe_stream: quicread EOF");
+                            return Ok(());
+                        }
+                        v
+                    },
                     Err(e) => {
                         debug!("pipe_stream: quicrecv error: {:?}", e);
-                        on_err_tx.send(e.into()).await?;
-                        break;
+                        return Err(e.into());
                     }
                 };
                 basewrite.write_all(&quicbuf[..v]).await?
@@ -246,20 +253,38 @@ pub async fn pipe_stream_tcp(
                     Ok(v) => {
                         if v == 0 {
                             debug!("pipe_stream: baserecv EOF");
-                            on_err_tx.send(anyhow!("EOF")).await?;
-                            break;
+                            return Ok(());
                         }
                         v
                     },
                     Err(e) => {
                         debug!("pipe_stream: baserecv error: {:?}", e);
-                        on_err_tx.send(e.into()).await?;
-                        break;
+                        return Err(e.into());
                     }
                 };
                 quicwrite.write_all(&basebuf[..v]).await?;
             }
         }
     }
+    return Ok(());
+}
+
+pub async fn ctrl_write_bytes_with_stream(
+    command: u8,
+    ctrl_write: &mut quinn::SendStream,
+    stream_id: u64,
+    buf: &[u8],
+) -> Result<()> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&[command]);
+    let mut len = [0u8; 2];
+    byteorder::BigEndian::write_u16(&mut len, buf.len() as u16 + 8);
+    out.extend_from_slice(&len);
+    let mut stream_id_buf = [0u8; 8];
+    byteorder::BigEndian::write_u64(&mut stream_id_buf, stream_id);
+    out.extend_from_slice(&stream_id_buf);
+    out.extend_from_slice(buf);
+    ctrl_write.write_all(&out).await?;
+
     return Ok(());
 }
