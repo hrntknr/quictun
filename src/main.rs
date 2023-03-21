@@ -21,13 +21,13 @@ async fn main() {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
                 .init();
             match quictun::client(
-                client_cert.str,
-                client_key.str,
+                &client_cert.str,
+                &client_key.str,
                 no_client_auth,
                 keep_alive,
                 conn_timeout,
-                endpoint,
-                target,
+                &endpoint,
+                &target,
                 quictun::Mode::NC,
             )
             .await
@@ -51,13 +51,13 @@ async fn main() {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
                 .init();
             match quictun::client(
-                client_cert.str,
-                client_key.str,
+                &client_cert.str,
+                &client_key.str,
                 no_client_auth,
                 keep_alive,
                 conn_timeout,
-                endpoint,
-                target,
+                &endpoint,
+                &target,
                 quictun::Mode::Client,
             )
             .await
@@ -85,17 +85,17 @@ async fn main() {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
                 .init();
             match quictun::server(
-                listen,
-                auto_generate,
-                cert.str,
-                key.str,
-                root_cert.str,
-                root_key.str,
-                client_cert.str,
-                client_key.str,
+                &listen,
+                &auto_generate,
+                &cert.str,
+                &key.str,
+                &root_cert.str,
+                &root_key.str,
+                &client_cert.str,
+                &client_key.str,
                 no_client_auth,
                 conn_timeout,
-                target_whitelist,
+                &target_whitelist,
             )
             .await
             {

@@ -1,19 +1,85 @@
 use anyhow::{anyhow, Result};
-use byteorder::ByteOrder;
 
 pub async fn server(
-    listen: String,
-    auto_generate: String,
-    cert: String,
-    key: String,
-    root_cert: String,
-    root_key: String,
-    client_cert: String,
-    client_key: String,
+    listen: &String,
+    auto_generate: &String,
+    cert: &String,
+    key: &String,
+    root_cert: &String,
+    root_key: &String,
+    client_cert: &String,
+    client_key: &String,
     no_client_auth: bool,
     conn_timeout: u64,
-    target_whitelist: String,
+    target_whitelist: &String,
 ) -> Result<()> {
+    let endpoint = server_init(
+        listen,
+        auto_generate,
+        cert,
+        key,
+        root_cert,
+        root_key,
+        client_cert,
+        client_key,
+        no_client_auth,
+        conn_timeout,
+    )
+    .await?;
+    info!("listening on {}", listen);
+
+    let stop = crate::util::handle_signal();
+    let mut handlers = Vec::new();
+    loop {
+        let mut stop = stop.clone();
+        tokio::select! {
+            Some(conn) = endpoint.accept() => {
+                debug!("connection incoming");
+                let conn = match conn.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(anyhow!("failed to accept connection: {}", e));
+                    }
+                };
+                let target_whitelist = target_whitelist.clone();
+                let handler = tokio::spawn(async move {
+                    return handle_connection(&target_whitelist, &conn, stop.clone()).await;
+                });
+                handlers.push(handler);
+            }
+            _ = stop.changed() => {
+                endpoint.wait_idle().await;
+                break;
+            }
+        }
+    }
+
+    match futures::future::join_all(handlers)
+        .await
+        .into_iter()
+        .find(|x| x.is_err())
+    {
+        Some(x) => {
+            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+        }
+        None => {}
+    }
+
+    return Ok(());
+}
+
+async fn server_init(
+    listen: &String,
+    auto_generate: &String,
+    cert: &String,
+    key: &String,
+    root_cert: &String,
+    root_key: &String,
+    client_cert: &String,
+    client_key: &String,
+    no_client_auth: bool,
+    conn_timeout: u64,
+) -> Result<quinn::Endpoint> {
     if auto_generate != "" {
         match crate::util::generate(
             no_client_auth,
@@ -42,12 +108,12 @@ pub async fn server(
     let key = async_std::fs::read(key).await?;
     let key =
         rustls_pemfile::pkcs8_private_keys(&mut &*key).expect("malformed PKCS #8 private key");
-    let key = match key.into_iter().next() {
-        Some(x) => rustls::PrivateKey(x),
+    let key = rustls::PrivateKey(match key.into_iter().next() {
+        Some(x) => x,
         None => {
             return Err(anyhow!("no keys found"));
         }
-    };
+    });
 
     let cert = async_std::fs::read(cert).await?;
     let cert = rustls_pemfile::certs(&mut &*cert).expect("invalid PEM-encoded certificate");
@@ -85,108 +151,55 @@ pub async fn server(
     quinn_server_config.transport_config(std::sync::Arc::new(transport_config));
     let endpoint = quinn::Endpoint::server(quinn_server_config, listen.parse()?)?;
 
-    info!("listening on {}", listen);
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(async move {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        let mut force = false;
-        loop {
-            tokio::select! {
-                _ = sigterm.recv() => println!("Recieve SIGTERM"),
-                _ = sigint.recv() => println!("Recieve SIGTERM"),
-            };
-            if force {
-                std::process::exit(1);
-            }
-            stop_tx.send(()).unwrap();
-            force = true;
-        }
-    });
-
-    loop {
-        let mut clone = stop_rx.clone();
-        tokio::select! {
-            Some(conn) = endpoint.accept() => {
-                debug!("connection incoming");
-                let conn = match conn.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Err(anyhow!("failed to accept connection: {}", e));
-                    }
-                };
-                let stop_rx_clone = stop_rx.clone();
-                let target_whitelist_clone = target_whitelist.clone();
-                tokio::spawn(async move {
-                    match handle_connection(target_whitelist_clone ,&conn, stop_rx_clone.clone()).await {
-                        Ok(_) => {
-                            conn.close(quinn::VarInt::from_u32(0u32), b"");
-                        }
-                        Err(e) => {
-                            conn.close(quinn::VarInt::from_u32(1u32), format!("{}", e).as_bytes());
-                        }
-                    }
-                });
-            }
-            _ = clone.changed() => {
-                endpoint.wait_idle().await;
-                break;
-            }
-        }
-    }
-
-    return Ok(());
+    return Ok(endpoint);
 }
 
 type Streams = std::sync::Arc<
     tokio::sync::RwLock<std::collections::HashMap<u64, (quinn::RecvStream, quinn::SendStream)>>,
 >;
-
 async fn handle_connection(
-    target_whitelist: String,
+    target_whitelist: &String,
     conn: &quinn::Connection,
-    stop_rx: tokio::sync::watch::Receiver<()>,
+    stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
-    info!("connection established: {:?}", conn.remote_address());
-    let streams = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let mut stop_rx_clone = stop_rx.clone();
-    let (on_err_tx, mut on_err_rx) = tokio::sync::mpsc::channel(1);
+    let streams: Streams =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut stop = stop.clone();
+    let mut handlers = Vec::new();
+    let mut result = Result::<()>::Ok(());
     loop {
         tokio::select! {
-            _ = stop_rx_clone.changed() => {
+            _ = conn.closed() => {
                 break;
             }
-            e = on_err_rx.recv() => {
-                let str = format!("{}", e.unwrap());
-                debug!("on_err_rx: {}", str);
-                // conn.close(quinn::VarInt::from_u32(1u32), str.as_bytes());
+            _ = stop.changed() => {
                 break;
             }
             stream = conn.accept_bi() => {
-                let (write, read) = match stream {
-                    Err(e) => {
-                        return Err(e.into());
-                    }
+                let (mut write, mut read) = match stream {
                     Ok(s) => s,
+                    Err(e) => {
+                        result = Err(anyhow!("failed to accept stream: {}", e));
+                        break;
+                    }
                 };
-                debug!("stream incoming: {:?}", read.id());
-                match read.id() {
-                    quinn::StreamId(0) => {
-                        let stream_clone =streams.clone();
-                        let stop_rx_clone = stop_rx.clone();
-                        let on_err_tx_clone = on_err_tx.clone();
-                        let target_whitelist_clone = target_whitelist.clone();
+                match read.id().index() {
+                    0 => {
+                        let target_whitelist = target_whitelist.clone();
                         let conn_clone = conn.clone();
-                        tokio::spawn(async move {
-                            match handle_ctrl_stream(target_whitelist_clone, &conn_clone, read, write, stream_clone, stop_rx_clone, on_err_tx_clone.clone()).await {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    let _ = on_err_tx_clone.try_send(e);
-                                }
-                            }
+                        let streams = streams.clone();
+                        let stop = stop.clone();
+                        let handler = tokio::spawn(async move {
+                            return handle_ctrl_stream(
+                                &target_whitelist,
+                                &conn_clone,
+                                &mut read,
+                                &mut write,
+                                &streams,
+                                stop.clone()
+                            ).await;
                         });
+                        handlers.push(handler);
                     }
                     _ => {
                         let index = read.id().index();
@@ -199,136 +212,137 @@ async fn handle_connection(
         }
     }
 
-    return Ok(());
+    match futures::future::join_all(handlers)
+        .await
+        .into_iter()
+        .find(|x| x.is_err())
+    {
+        Some(x) => {
+            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+        }
+        None => {}
+    }
+
+    return result;
 }
 
 async fn handle_ctrl_stream(
-    target_whitelist: String,
+    target_whitelist: &String,
     conn: &quinn::Connection,
-    mut ctrl_read: quinn::RecvStream,
-    mut ctrl_write: quinn::SendStream,
-    streams: Streams,
-    stop_rx: tokio::sync::watch::Receiver<()>,
-    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+    ctrl_read: &mut quinn::RecvStream,
+    _ctrl_write: &mut quinn::SendStream,
+    streams: &Streams,
+    stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let mut buf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut read_remain = Vec::new();
 
-    let mut stop_rx_clone = stop_rx.clone();
+    let mut stop = stop.clone();
+    let mut handlers = Vec::new();
     loop {
         tokio::select! {
-            _ = stop_rx_clone.changed() => {
+            _ = conn.closed() => {
+                break;
+            }
+            _ = stop.changed() => {
                 break;
             }
             r = ctrl_read.read(&mut buf) => {
-                match r {
+                let v = match r {
                     Err(e) => {
                         return Err(anyhow!("failed to read from ctrl stream: {}", e));
                     }
                     Ok(None) => {
                         break;
                     }
-                    Ok(Some(v)) => {
-                        read_remain.extend_from_slice(&buf[..v]);
-                        loop {
-                            if 0 == read_remain.len() {
-                                break;
-                            }
-                            if 3 > read_remain.len() {
-                                break;
-                            }
-                            let command = read_remain[0];
-                            let length = byteorder::BigEndian::read_u16(&read_remain[1..3]) as usize;
-                            if 3 + length > read_remain.len() {
-                                break;
-                            }
-                            let payload = &read_remain[3..3 + length];
-
-                            handle_command(conn,target_whitelist.clone(), command, payload, streams.clone(), &mut ctrl_write, stop_rx.clone(), on_err_tx.clone()).await?;
-
-                            read_remain.drain(..3 + length);
+                    Ok(Some(v)) => v,
+                };
+                read_remain.extend_from_slice(&buf[..v]);
+                loop {
+                    let (parsed, n) = match crate::util::parse_pkt_ctrl_cmd(&read_remain) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            break;
                         }
-                    }
+                    };
+                    let conn = conn.clone();
+                    let target_whitelist = target_whitelist.clone();
+                    let streams = streams.clone();
+                    let stop = stop.clone();
+                    let handler = tokio::spawn(async move {
+                        return handle_command(
+                            &conn,
+                            &target_whitelist,
+                            parsed.command,
+                            parsed.stream_id,
+                            &parsed.buf,
+                            &streams,
+                            stop.clone()
+                        ).await;
+                    });
+                    handlers.push(handler);
+                    read_remain.drain(..n);
                 }
             }
         }
+    }
+
+    match futures::future::join_all(handlers)
+        .await
+        .into_iter()
+        .find(|x| x.is_err())
+    {
+        Some(x) => {
+            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+        }
+        None => {}
     }
 
     return Ok(());
 }
 
 async fn handle_command(
-    conn: &quinn::Connection,
-    target_whitelist: String,
+    _conn: &quinn::Connection,
+    target_whitelist: &String,
     command: u8,
+    stream_id: u64,
     payload: &[u8],
-    streams: Streams,
-    ctrl_write: &mut quinn::SendStream,
-    mut stop_rx: tokio::sync::watch::Receiver<()>,
-    on_err_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+    streams: &Streams,
+    stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     match command {
         0x00 => {
             return Ok(());
         }
         0x01 => {
-            if 8 > payload.len() {
-                return Err(anyhow!("invalid payload length"));
-            }
-            let stream_id = byteorder::BigEndian::read_u64(payload[0..8].as_ref());
             debug!("open stream: {}", stream_id);
-            let target = std::str::from_utf8(&payload[8..])?;
+            let target = std::str::from_utf8(&payload)?;
             debug!("target: {}", target);
-            if !regex::Regex::new(&target_whitelist)?.is_match(target) {
+            if !regex::Regex::new(target_whitelist)?.is_match(target) {
                 return Err(anyhow!("target not allowed: {}", target));
             }
-
-            let tcp_stream = match tokio::net::TcpStream::connect(target).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("failed to connect to target: {}", e.to_string());
-                    crate::util::ctrl_write_bytes_with_stream(
-                        0x02,
-                        ctrl_write,
-                        stream_id,
-                        target.as_bytes(),
-                    )
-                    .await?;
-                    return Ok(());
+            let mut streams = streams.write().await;
+            let (quic_read, quic_write) = match streams.get_mut(&stream_id) {
+                Some((r, w)) => (r, w),
+                None => {
+                    return Err(anyhow!("stream not found: {}", stream_id));
                 }
             };
-            let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
-            let conn_clone = conn.clone();
-            tokio::spawn(async move {
-                let mut streams = streams.write().await;
-                let (quic_read, quic_write) = match streams.get_mut(&stream_id) {
-                    Some((r, w)) => (r, w),
-                    None => {
-                        let _ = on_err_tx.try_send(anyhow!("stream not found: {}", stream_id));
-                        return;
-                    }
-                };
-                match crate::util::pipe_stream_tcp(
-                    &conn_clone,
-                    quic_read,
-                    quic_write,
-                    &mut tcp_read,
-                    &mut tcp_write,
-                    &mut stop_rx,
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = on_err_tx.try_send(e);
-                    }
-                };
-            });
 
-            return Ok(());
-        }
-        0x02 => {
-            debug!("close stream!!!!!!");
+            let tcp_stream = tokio::net::TcpStream::connect(target)
+                .await
+                .map_err(|e| anyhow!(e))?;
+            let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
+
+            crate::util::pipe_stream_tcp(
+                quic_read,
+                quic_write,
+                &mut tcp_read,
+                &mut tcp_write,
+                &mut stop.clone(),
+            )
+            .await?;
+
             return Ok(());
         }
         _ => {

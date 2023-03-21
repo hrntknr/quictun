@@ -3,6 +3,45 @@ use async_std::io::{ReadExt, WriteExt};
 use byteorder::ByteOrder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[derive(Debug, Clone)]
+pub struct PortAddress {
+    pub port: u16,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError;
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid port address")
+    }
+}
+
+impl std::str::FromStr for PortAddress {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let idx = s.find(':');
+        if idx.is_none() {
+            return Err(ParseError);
+        }
+        let (port, address) = s.split_at(idx.unwrap());
+        let port = match port
+            .parse::<u16>()
+            .map_err(|e| format!("Invalid port: {}", e))
+        {
+            Ok(0) => return Err(ParseError),
+            Ok(v) => v,
+            Err(_) => return Err(ParseError),
+        };
+        Ok(Self {
+            port,
+            address: address[1..].to_string(),
+        })
+    }
+}
+
 pub async fn generate(
     no_client_auth: bool,
     hostname: &String,
@@ -149,7 +188,6 @@ async fn generate_root(
 }
 
 pub async fn pipe_stream_std(
-    conn: &quinn::Connection,
     quicread: &mut quinn::RecvStream,
     quicwrite: &mut quinn::SendStream,
     baseread: &mut async_std::io::Stdin,
@@ -161,10 +199,6 @@ pub async fn pipe_stream_std(
 
     loop {
         tokio::select! {
-            _ = conn.closed() => {
-                debug!("pipe_stream: conn closed");
-                break;
-            }
             _ = stop_rx.changed() => {
                 debug!("pipe_stream: stop_rx changed");
                 break;
@@ -180,7 +214,7 @@ pub async fn pipe_stream_std(
                         v
                     },
                     Err(e) => {
-                        debug!("pipe_stream: quicrecv error: {:?}", e);
+                        debug!("pipe_stream: quicrecv error: {}", e);
                         return Err(e.into());
                     }
                 };
@@ -198,7 +232,7 @@ pub async fn pipe_stream_std(
                         v
                     },
                     Err(e) => {
-                        debug!("pipe_stream: baserecv error: {:?}", e);
+                        debug!("pipe_stream: baserecv error: {}", e);
                         return Err(e.into());
                     }
                 };
@@ -206,11 +240,11 @@ pub async fn pipe_stream_std(
             }
         }
     }
+    quicwrite.finish().await?;
     return Ok(());
 }
 
 pub async fn pipe_stream_tcp(
-    conn: &quinn::Connection,
     quicread: &mut quinn::RecvStream,
     quicwrite: &mut quinn::SendStream,
     baseread: &mut tokio::io::ReadHalf<tokio::net::TcpStream>,
@@ -222,10 +256,6 @@ pub async fn pipe_stream_tcp(
 
     loop {
         tokio::select! {
-            _ = conn.closed() => {
-                debug!("pipe_stream: conn closed");
-                break;
-            }
             _ = stop_rx.changed() => {
                 debug!("pipe_stream: stop_rx changed");
                 break;
@@ -241,7 +271,7 @@ pub async fn pipe_stream_tcp(
                         v
                     },
                     Err(e) => {
-                        debug!("pipe_stream: quicrecv error: {:?}", e);
+                        debug!("pipe_stream: quicrecv error: {}", e);
                         return Err(e.into());
                     }
                 };
@@ -258,7 +288,7 @@ pub async fn pipe_stream_tcp(
                         v
                     },
                     Err(e) => {
-                        debug!("pipe_stream: baserecv error: {:?}", e);
+                        debug!("pipe_stream: baserecv error: {}", e);
                         return Err(e.into());
                     }
                 };
@@ -266,25 +296,75 @@ pub async fn pipe_stream_tcp(
             }
         }
     }
+    basewrite.shutdown().await?;
+    quicwrite.finish().await?;
     return Ok(());
 }
 
-pub async fn ctrl_write_bytes_with_stream(
-    command: u8,
-    ctrl_write: &mut quinn::SendStream,
-    stream_id: u64,
-    buf: &[u8],
-) -> Result<()> {
+#[derive(Clone, Debug)]
+pub struct CtrlPktStream {
+    pub command: u8,
+    pub stream_id: u64,
+    pub buf: Vec<u8>,
+}
+
+pub fn create_pkt_ctrl_cmd(command: u8, stream_id: u64, buf: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&[command]);
-    let mut len = [0u8; 2];
-    byteorder::BigEndian::write_u16(&mut len, buf.len() as u16 + 8);
-    out.extend_from_slice(&len);
     let mut stream_id_buf = [0u8; 8];
     byteorder::BigEndian::write_u64(&mut stream_id_buf, stream_id);
     out.extend_from_slice(&stream_id_buf);
+    let mut len = [0u8; 2];
+    byteorder::BigEndian::write_u16(&mut len, buf.len() as u16);
+    out.extend_from_slice(&len);
     out.extend_from_slice(buf);
-    ctrl_write.write_all(&out).await?;
 
-    return Ok(());
+    return out;
+}
+
+pub fn parse_pkt_ctrl_cmd(buf: &[u8]) -> Result<(CtrlPktStream, usize)> {
+    if buf.len() < 11 {
+        return Err(anyhow!("invalid ctrl pkt"));
+    }
+    let command = buf[0];
+    let stream_id = byteorder::BigEndian::read_u64(&buf[1..9]);
+    let len = byteorder::BigEndian::read_u16(&buf[9..11]) as usize;
+    if buf.len() < 11 + len {
+        return Err(anyhow!("invalid ctrl pkt"));
+    }
+    let buf = &buf[11..11 + len];
+    let mut copy = Vec::new();
+    copy.copy_from_slice(buf);
+
+    return Ok((
+        CtrlPktStream {
+            command: command,
+            stream_id,
+            buf: copy,
+        },
+        buf.len() + 11,
+    ));
+}
+
+pub fn handle_signal() -> tokio::sync::watch::Receiver<()> {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let mut force = false;
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => println!("Recieve SIGTERM"),
+                _ = sigint.recv() => println!("Recieve SIGTERM"),
+            };
+            if force {
+                std::process::exit(1);
+            }
+            stop_tx.send(()).unwrap();
+            force = true;
+        }
+    });
+    return stop_rx;
 }
