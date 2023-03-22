@@ -1,7 +1,6 @@
+use anyhow::{anyhow, Result};
 use std::str::FromStr;
 
-use crate::PortAddress;
-use anyhow::{anyhow, Result};
 struct SkipServerVerification;
 impl SkipServerVerification {
     fn new() -> std::sync::Arc<Self> {
@@ -37,7 +36,6 @@ pub async fn client(
         client_cert,
         client_key,
         no_client_auth,
-        keep_alive,
         conn_timeout,
         remote,
     )
@@ -52,9 +50,7 @@ pub async fn client(
         crate::Mode::Client => {
             handle_stream_client(&conn, read, write, target, keep_alive, stop).await?
         }
-        crate::Mode::NC => {
-            // handle_stream_nc(&conn, read, write, target, keep_alive, stop).await?
-        }
+        crate::Mode::NC => handle_stream_nc(&conn, read, write, target, keep_alive, stop).await?,
     };
 
     endpoint.close(quinn::VarInt::from_u32(0), b"");
@@ -66,7 +62,6 @@ async fn client_init(
     client_cert: &String,
     client_key: &String,
     no_client_auth: bool,
-    keep_alive: u64,
     conn_timeout: u64,
     remote: &String,
 ) -> Result<(std::net::SocketAddr, String, quinn::Endpoint)> {
@@ -137,88 +132,46 @@ async fn client_init(
     return Ok((peer_addr, host.to_string(), endpoint));
 }
 
-// async fn handle_stream_nc(
-//     conn: &quinn::Connection,
-//     _ctrl_read: quinn::RecvStream,
-//     mut ctrl_write: quinn::SendStream,
-//     target: String,
-//     keep_alive: u64,
-//     mut stop: tokio::sync::watch::Receiver<()>,
-// ) -> Result<()> {
-//     let (mut data_write, mut data_read) = conn.open_bi().await?;
-//     data_write.write(b"").await?;
-
-//     let stream_id = data_read.id().index();
-//     debug!("data stream opened: {}", stream_id);
-
-//     let conn_clone = conn.clone();
-
-//     debug!("start stream: {}", stream_id);
-//     crate::util::ctrl_write_bytes_with_stream(0x01, &mut ctrl_write, stream_id, target.as_bytes())
-//         .await?;
-//     let mut code = 0u32;
-//     let mut reason = Vec::new();
-//     let mut stdin = async_std::io::stdin();
-//     let mut stdout = async_std::io::stdout();
-//     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
-//     loop {
-//         tokio::select! {
-//             v = crate::util::pipe_stream_std(
-//                 &conn_clone,
-//                 &mut data_read,
-//                 &mut data_write,
-//                 &mut stdin,
-//                 &mut stdout,
-//                 &mut stop,
-//             ) => {
-//                 debug!("pipe_stream_std: {:?}", v);
-//                 match v {
-//                     Ok(_) => {
-//                         break;
-//                     }
-//                     Err(e) => {
-//                         code = 1;
-//                         reason = e.to_string().into_bytes();
-//                         break;
-//                     }
-//                 }
-//             }
-//             _ = interval.tick() => {
-//                 debug!("client: interval tick");
-//                 match ctrl_write.write_all(&[0x00,0x00,0x00]).await {
-//                     Ok(v) => {
-//                         debug!("client: send: {:?}", v);
-//                     }
-//                     Err(e) => {
-//                         error!("client: send error: {}", e);
-//                         code = 1;
-//                         reason = b"keep alive failed".to_vec();
-//                         break;
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     debug!("closing connection");
-//     conn.close(quinn::VarInt::from_u32(code), &reason);
-//     return Ok(());
-// }
-
-async fn handle_stream_client(
+async fn handle_stream_nc(
     conn: &quinn::Connection,
-    mut ctrl_read: quinn::RecvStream,
+    _ctrl_read: quinn::RecvStream,
     mut ctrl_write: quinn::SendStream,
     target: &String,
     keep_alive: u64,
     stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
-    let target: PortAddress = target.parse().map_err(|_| anyhow!("invalid target"))?;
+    let (mut data_write, mut data_read) = conn.open_bi().await?;
+    data_write.write(b"").await?;
 
+    let stream_id = data_read.id().index();
+    debug!("data stream opened: {}", stream_id);
+
+    let conn_clone = conn.clone();
+    let stop_clone = stop.clone();
+    let mut handler = tokio::spawn(async move {
+        return crate::util::pipe_stream_std(
+            &conn_clone,
+            &mut data_read,
+            &mut data_write,
+            &mut async_std::io::stdin(),
+            &mut async_std::io::stdout(),
+            stop_clone,
+        )
+        .await;
+    });
+
+    ctrl_write
+        .write(&crate::util::create_pkt_ctrl_cmd(
+            0x01,
+            stream_id,
+            target.as_bytes(),
+        ))
+        .await?;
+
+    let keepalive = &[0u8; 11];
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
-    let listener = tokio::net::TcpListener::bind(format!("[::1]:{}", target.port)).await?;
     let mut stop = stop.clone();
-    let mut handlers = Vec::new();
+    let mut handler_closed = false;
     loop {
         tokio::select! {
             _ = conn.closed() => {
@@ -231,7 +184,63 @@ async fn handle_stream_client(
             }
             _ = interval.tick() => {
                 debug!("client: interval tick");
-                match ctrl_write.write_all(&[0u8; 11]).await {
+                match ctrl_write.write(keepalive).await {
+                    Ok(v) => {
+                        debug!("client: send: {:?}", v);
+                    }
+                    Err(e) => {
+                        error!("client: send error: {}", e);
+                        break;
+                    }
+                }
+            }
+            r = &mut handler => {
+                r??;
+                handler_closed = true;
+                debug!("client: handler done");
+                break;
+            }
+        }
+    }
+
+    if !handler_closed {
+        handler.await??;
+    }
+
+    conn.close(quinn::VarInt::from_u32(0), b"");
+
+    return Ok(());
+}
+
+async fn handle_stream_client(
+    conn: &quinn::Connection,
+    _ctrl_read: quinn::RecvStream,
+    ctrl_write: quinn::SendStream,
+    target: &String,
+    keep_alive: u64,
+    stop: tokio::sync::watch::Receiver<()>,
+) -> Result<()> {
+    let target = crate::util::PortAddress::from_str(target).map_err(|e| anyhow!(e))?;
+
+    let keepalive = &[0u8; 11];
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(keep_alive));
+    let listener = tokio::net::TcpListener::bind(format!("[::1]:{}", target.port)).await?;
+    let mut stop = stop.clone();
+    let mut handlers = Vec::new();
+    let ctrl_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(ctrl_write));
+    loop {
+        tokio::select! {
+            _ = conn.closed() => {
+                debug!("conn closed");
+                break;
+            }
+            _ = stop.changed() => {
+                debug!("stop changed");
+                break;
+            }
+            _ = interval.tick() => {
+                debug!("client: interval tick");
+                match ctrl_write_lock.lock().await.write(keepalive).await {
                     Ok(v) => {
                         debug!("client: send: {:?}", v);
                     }
@@ -246,17 +255,21 @@ async fn handle_stream_client(
                     Ok((stream, _)) => {
                         debug!("accept");
                         let (mut read, mut write) = tokio::io::split(stream);
+                        let conn = conn.clone();
+                        let ctrl_write_lock = ctrl_write_lock.clone();
+                        let target = target.address.clone();
+                        let stop = stop.clone();
                         let handler = tokio::spawn(async move {
                             return handle_stream_client_accept(
                                 &conn,
-                                &mut ctrl_read,
-                                &mut ctrl_write,
+                                ctrl_write_lock,
                                 &mut read,
                                 &mut write,
-                                target.address.clone(),
+                                &target,
                                 stop.clone()
                             ).await;
                         });
+                        handlers.push(handler);
                     }
                     Err(e) => {
                         error!("accept error: {}", e);
@@ -282,34 +295,38 @@ async fn handle_stream_client(
 
 async fn handle_stream_client_accept(
     conn: &quinn::Connection,
-    _ctrl_read: &mut quinn::RecvStream,
-    ctrl_write: &mut quinn::SendStream,
+    ctrl_write_lock: std::sync::Arc<tokio::sync::Mutex<quinn::SendStream>>,
     tcp_read: &mut tokio::io::ReadHalf<tokio::net::TcpStream>,
     tcp_write: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
-    target: String,
-    mut stop: tokio::sync::watch::Receiver<()>,
+    target: &String,
+    stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
+    let (mut data_write, mut data_read) = conn.open_bi().await?;
+    data_write.write(b"").await?;
+
+    let stream_id = data_read.id().index();
+    debug!("data stream opened: {}", stream_id);
+
+    debug!("start stream: {}", stream_id);
+    ctrl_write_lock
+        .lock()
+        .await
+        .write(&crate::util::create_pkt_ctrl_cmd(
+            0x01,
+            stream_id,
+            target.as_bytes(),
+        ))
+        .await?;
+
+    crate::util::pipe_stream_tcp(
+        conn,
+        &mut data_read,
+        &mut data_write,
+        tcp_read,
+        tcp_write,
+        stop,
+    )
+    .await?;
+
     return Ok(());
 }
-//     let (mut data_write, mut data_read) = conn.open_bi().await?;
-//     data_write.write(b"").await?;
-
-//     let stream_id = data_read.id().index();
-//     debug!("data stream opened: {}", stream_id);
-
-//     debug!("start stream: {}", stream_id);
-//     crate::util::ctrl_write_bytes_with_stream(0x01, ctrl_write, stream_id, target.as_bytes())
-//         .await?;
-//     crate::util::pipe_stream_tcp(
-//         conn,
-//         &mut data_read,
-//         &mut data_write,
-//         tcp_read,
-//         tcp_write,
-//         &mut stop,
-//     )
-//     .await?;
-//     crate::util::ctrl_write_bytes_with_stream(0x02, ctrl_write, stream_id, target.as_bytes())
-//         .await?;
-//     return Ok(());
-// }

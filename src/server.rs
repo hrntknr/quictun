@@ -29,7 +29,7 @@ pub async fn server(
     info!("listening on {}", listen);
 
     let stop = crate::util::handle_signal();
-    let mut handlers = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
     loop {
         let mut stop = stop.clone();
         tokio::select! {
@@ -42,27 +42,35 @@ pub async fn server(
                     }
                 };
                 let target_whitelist = target_whitelist.clone();
-                let handler = tokio::spawn(async move {
+                let fut = async move {
                     return handle_connection(&target_whitelist, &conn, stop.clone()).await;
-                });
-                handlers.push(handler);
+                };
+                set.spawn(fut);
             }
             _ = stop.changed() => {
                 endpoint.wait_idle().await;
                 break;
             }
+            Some(res) = set.join_next() => {
+                match res.unwrap() {
+                    Ok(_) => {
+                        debug!("handle_connection closed");
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("failed to handle connection: {}", e));
+                    }
+                }
+            }
         }
     }
 
-    match futures::future::join_all(handlers)
-        .await
-        .into_iter()
-        .find(|x| x.is_err())
-    {
-        Some(x) => {
-            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+    while let Some(res) = set.join_next().await {
+        match res.unwrap() {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow!("failed to handle connection: {}", e));
+            }
         }
-        None => {}
     }
 
     return Ok(());
@@ -162,11 +170,11 @@ async fn handle_connection(
     conn: &quinn::Connection,
     stop: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
+    info!("{}: connection established", conn.remote_address());
     let streams: Streams =
         std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let mut stop = stop.clone();
-    let mut handlers = Vec::new();
-    let mut result = Result::<()>::Ok(());
+    let mut set = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = conn.closed() => {
@@ -179,17 +187,19 @@ async fn handle_connection(
                 let (mut write, mut read) = match stream {
                     Ok(s) => s,
                     Err(e) => {
-                        result = Err(anyhow!("failed to accept stream: {}", e));
+                        debug!("failed to accept stream: {}", e);
                         break;
                     }
                 };
+                debug!("accepted quic stream: {}", read.id().index());
+
                 match read.id().index() {
                     0 => {
                         let target_whitelist = target_whitelist.clone();
                         let conn_clone = conn.clone();
                         let streams = streams.clone();
                         let stop = stop.clone();
-                        let handler = tokio::spawn(async move {
+                        let fut = async move {
                             return handle_ctrl_stream(
                                 &target_whitelist,
                                 &conn_clone,
@@ -197,9 +207,9 @@ async fn handle_connection(
                                 &mut write,
                                 &streams,
                                 stop.clone()
-                            ).await;
-                        });
-                        handlers.push(handler);
+                            ).await
+                        };
+                        set.spawn(fut);
                     }
                     _ => {
                         let index = read.id().index();
@@ -212,18 +222,17 @@ async fn handle_connection(
         }
     }
 
-    match futures::future::join_all(handlers)
-        .await
-        .into_iter()
-        .find(|x| x.is_err())
-    {
-        Some(x) => {
-            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+    while let Some(res) = set.join_next().await {
+        match res.unwrap() {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow!("failed to handle connection: {}", e));
+            }
         }
-        None => {}
     }
 
-    return result;
+    info!("{}: connection closed", conn.remote_address());
+    return Ok(());
 }
 
 async fn handle_ctrl_stream(
@@ -238,7 +247,7 @@ async fn handle_ctrl_stream(
     let mut read_remain = Vec::new();
 
     let mut stop = stop.clone();
-    let mut handlers = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = conn.closed() => {
@@ -250,7 +259,8 @@ async fn handle_ctrl_stream(
             r = ctrl_read.read(&mut buf) => {
                 let v = match r {
                     Err(e) => {
-                        return Err(anyhow!("failed to read from ctrl stream: {}", e));
+                        debug!("failed to read from ctrl stream: {}", e);
+                        break;
                     }
                     Ok(None) => {
                         break;
@@ -269,40 +279,44 @@ async fn handle_ctrl_stream(
                     let target_whitelist = target_whitelist.clone();
                     let streams = streams.clone();
                     let stop = stop.clone();
-                    let handler = tokio::spawn(async move {
-                        return handle_command(
-                            &conn,
-                            &target_whitelist,
-                            parsed.command,
-                            parsed.stream_id,
-                            &parsed.buf,
-                            &streams,
-                            stop.clone()
-                        ).await;
-                    });
-                    handlers.push(handler);
+                    debug!("new command: {:?}", parsed);
+                    let fut = async move {
+                        let res = crate::util::no_error(
+                            handle_command(
+                                &conn,
+                                &target_whitelist,
+                                parsed.command,
+                                parsed.stream_id,
+                                &parsed.buf,
+                                &streams,
+                                stop
+                            ).await
+                        );
+                        debug!("command finished: {:?}", res);
+                        return res;
+                    };
+                    set.spawn(fut);
                     read_remain.drain(..n);
                 }
             }
         }
     }
 
-    match futures::future::join_all(handlers)
-        .await
-        .into_iter()
-        .find(|x| x.is_err())
-    {
-        Some(x) => {
-            return Err(anyhow!("failed to handle connection: {}", x.err().unwrap()));
+    while let Some(res) = set.join_next().await {
+        match res.unwrap() {
+            Ok(_) => {}
+            Err(e) => {
+                debug!("failed to handle command: {}", e);
+                return Err(anyhow!("failed to handle command: {}", e));
+            }
         }
-        None => {}
     }
 
     return Ok(());
 }
 
 async fn handle_command(
-    _conn: &quinn::Connection,
+    conn: &quinn::Connection,
     target_whitelist: &String,
     command: u8,
     stream_id: u64,
@@ -316,37 +330,37 @@ async fn handle_command(
         }
         0x01 => {
             debug!("open stream: {}", stream_id);
-            let target = std::str::from_utf8(&payload)?;
-            debug!("target: {}", target);
+            let target = std::str::from_utf8(&payload).unwrap();
+            info!("{}: connect to {}", conn.remote_address(), target);
             if !regex::Regex::new(target_whitelist)?.is_match(target) {
                 return Err(anyhow!("target not allowed: {}", target));
             }
             let mut streams = streams.write().await;
-            let (quic_read, quic_write) = match streams.get_mut(&stream_id) {
-                Some((r, w)) => (r, w),
-                None => {
-                    return Err(anyhow!("stream not found: {}", stream_id));
+            let (quic_read, quic_write) = streams.get_mut(&stream_id).unwrap();
+            let tcp_stream = match tokio::net::TcpStream::connect(target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    quic_write.finish().await?;
+                    return Err(anyhow!("failed to connect to target: {}", e));
                 }
             };
-
-            let tcp_stream = tokio::net::TcpStream::connect(target)
-                .await
-                .map_err(|e| anyhow!(e))?;
             let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
 
             crate::util::pipe_stream_tcp(
+                conn,
                 quic_read,
                 quic_write,
                 &mut tcp_read,
                 &mut tcp_write,
-                &mut stop.clone(),
+                stop,
             )
             .await?;
 
+            info!("{}: disconnected from {}", conn.remote_address(), target);
             return Ok(());
         }
         _ => {
             return Err(anyhow!("unknown command"));
         }
-    }
+    };
 }

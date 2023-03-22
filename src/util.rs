@@ -9,16 +9,16 @@ pub struct PortAddress {
     pub address: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Copy, Eq, PartialEq, Clone, Debug)]
 pub struct ParseError;
-
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Invalid port address")
+        write!(f, "ParseError")
     }
 }
 
 impl std::str::FromStr for PortAddress {
+    // type Err = ParseError;
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -188,37 +188,46 @@ async fn generate_root(
 }
 
 pub async fn pipe_stream_std(
+    conn: &quinn::Connection,
     quicread: &mut quinn::RecvStream,
     quicwrite: &mut quinn::SendStream,
     baseread: &mut async_std::io::Stdin,
     basewrite: &mut async_std::io::Stdout,
-    stop_rx: &mut tokio::sync::watch::Receiver<()>,
+    mut stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
-
+    let mut result = Ok(());
     loop {
         tokio::select! {
+            _ = conn.closed() => {
+                debug!("pipe_stream: conn closed");
+                break;
+            }
             _ = stop_rx.changed() => {
                 debug!("pipe_stream: stop_rx changed");
                 break;
             }
             v = quicread.read(&mut quicbuf) => {
                 let v = match v {
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        debug!("pipe_stream: quicread EOF");
+                        break;
+                    }
                     Ok(Some(v)) => {
                         if v == 0 {
                             debug!("pipe_stream: quicread EOF");
-                            return Ok(());
+                            break;
                         }
                         v
-                    },
+                    }
                     Err(e) => {
                         debug!("pipe_stream: quicrecv error: {}", e);
-                        return Err(e.into());
+                        result = Err(e.into());
+                        break;
                     }
                 };
-                basewrite.write_all(&quicbuf[..v]).await?;
+                basewrite.write(&quicbuf[..v]).await?;
                 basewrite.flush().await?;
             },
 
@@ -227,78 +236,90 @@ pub async fn pipe_stream_std(
                     Ok(v) => {
                         if v == 0 {
                             debug!("pipe_stream: baseread EOF");
-                            return Ok(());
+                            break;
                         }
                         v
                     },
                     Err(e) => {
                         debug!("pipe_stream: baserecv error: {}", e);
-                        return Err(e.into());
+                        result = Err(e.into());
+                        break;
                     }
                 };
-                quicwrite.write_all(&basebuf[..v]).await?;
+                quicwrite.write(&basebuf[..v]).await?;
             }
         }
     }
+    debug!("pipe_stream: shutdown");
     quicwrite.finish().await?;
-    return Ok(());
+    return result;
 }
 
 pub async fn pipe_stream_tcp(
+    conn: &quinn::Connection,
     quicread: &mut quinn::RecvStream,
     quicwrite: &mut quinn::SendStream,
     baseread: &mut tokio::io::ReadHalf<tokio::net::TcpStream>,
     basewrite: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
-    stop_rx: &mut tokio::sync::watch::Receiver<()>,
+    mut stop_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
-
+    let mut result = Ok(());
     loop {
         tokio::select! {
+            _ = conn.closed() => {
+                debug!("pipe_stream: conn closed");
+                break;
+            }
             _ = stop_rx.changed() => {
                 debug!("pipe_stream: stop_rx changed");
                 break;
             }
             v = quicread.read(&mut quicbuf) => {
                 let v = match v {
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        debug!("pipe_stream: quicread EOF");
+                        break;
+                    }
                     Ok(Some(v)) => {
                         if v == 0 {
                             debug!("pipe_stream: quicread EOF");
-                            return Ok(());
+                            break;
                         }
                         v
-                    },
+                    }
                     Err(e) => {
                         debug!("pipe_stream: quicrecv error: {}", e);
-                        return Err(e.into());
+                        result = Err(e.into());
+                        break;
                     }
                 };
-                basewrite.write_all(&quicbuf[..v]).await?
+                basewrite.write(&quicbuf[..v]).await?;
             },
-
             v = baseread.read(&mut basebuf) => {
                 let v = match v {
                     Ok(v) => {
                         if v == 0 {
                             debug!("pipe_stream: baserecv EOF");
-                            return Ok(());
+                            break;
                         }
                         v
-                    },
+                    }
                     Err(e) => {
                         debug!("pipe_stream: baserecv error: {}", e);
-                        return Err(e.into());
+                        result = Err(e.into());
+                        break;
                     }
                 };
-                quicwrite.write_all(&basebuf[..v]).await?;
+                quicwrite.write(&basebuf[..v]).await?;
             }
         }
     }
+    debug!("pipe_stream: shutdown");
     basewrite.shutdown().await?;
     quicwrite.finish().await?;
-    return Ok(());
+    return result;
 }
 
 #[derive(Clone, Debug)]
@@ -334,7 +355,7 @@ pub fn parse_pkt_ctrl_cmd(buf: &[u8]) -> Result<(CtrlPktStream, usize)> {
     }
     let buf = &buf[11..11 + len];
     let mut copy = Vec::new();
-    copy.copy_from_slice(buf);
+    copy.extend_from_slice(buf);
 
     return Ok((
         CtrlPktStream {
@@ -367,4 +388,14 @@ pub fn handle_signal() -> tokio::sync::watch::Receiver<()> {
         }
     });
     return stop_rx;
+}
+
+pub fn no_error(a: Result<()>) -> Result<()> {
+    match a {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            debug!("no_error: {}", e);
+            Ok(())
+        }
+    }
 }
