@@ -227,6 +227,7 @@ pub async fn pipe_stream_std(
                         break;
                     }
                 };
+                trace!("pipe_stream: quicread {} bytes", v);
                 basewrite.write(&quicbuf[..v]).await?;
                 basewrite.flush().await?;
             },
@@ -312,6 +313,7 @@ pub async fn pipe_stream_tcp(
                         break;
                     }
                 };
+                trace!("pipe_stream: baseread {} bytes", v);
                 quicwrite.write(&basebuf[..v]).await?;
             }
         }

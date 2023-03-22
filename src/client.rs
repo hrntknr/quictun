@@ -67,7 +67,7 @@ async fn client_init(
 ) -> Result<(std::net::SocketAddr, String, quinn::Endpoint)> {
     let remote = url::Url::parse(&remote)?;
     if remote.scheme() != "quic" {
-        return Err(anyhow!("Length must be less than 10"));
+        return Err(anyhow!("invalid scheme"));
     }
     let host = match remote.host_str() {
         Some(v) => v,

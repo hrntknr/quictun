@@ -335,8 +335,15 @@ async fn handle_command(
             if !regex::Regex::new(target_whitelist)?.is_match(target) {
                 return Err(anyhow!("target not allowed: {}", target));
             }
-            let mut streams = streams.write().await;
-            let (quic_read, quic_write) = streams.get_mut(&stream_id).unwrap();
+            let (mut quic_read, mut quic_write) = {
+                let mut streams = streams.write().await;
+                match streams.remove(&stream_id) {
+                    Some(v) => v,
+                    None => {
+                        return Err(anyhow!("stream not found: {}", stream_id));
+                    }
+                }
+            };
             let tcp_stream = match tokio::net::TcpStream::connect(target).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -348,8 +355,8 @@ async fn handle_command(
 
             crate::util::pipe_stream_tcp(
                 conn,
-                quic_read,
-                quic_write,
+                &mut quic_read,
+                &mut quic_write,
                 &mut tcp_read,
                 &mut tcp_write,
                 stop,
