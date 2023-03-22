@@ -36,6 +36,12 @@ Host *
   ProxyCommand quictun nc --no-client-auth quic://{server_address}:2222 %h:%p
 ```
 
+## client mode
+By using client mode, it works similar to the L option of ssh.
+```
+quictun client quic://{server_address}:2222 8080:localhost:8080
+```
+
 ## Client Auth
 
 If you disable --no-client-auth and start the server, ca/client certificate will be generated in the config directory.  
