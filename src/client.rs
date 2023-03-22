@@ -54,6 +54,7 @@ pub async fn client(
     };
 
     endpoint.close(quinn::VarInt::from_u32(0), b"");
+    tokio::time::sleep(std::time::Duration::from_secs(0)).await;
 
     return Ok(());
 }

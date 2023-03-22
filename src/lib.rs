@@ -6,7 +6,7 @@ pub enum Mode {
     Client,
 }
 
-const MAX_DATAGRAM_SIZE: usize = 0xffffffff;
+const MAX_DATAGRAM_SIZE: usize = 0xffff;
 
 mod client;
 mod server;
