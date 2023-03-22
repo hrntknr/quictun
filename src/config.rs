@@ -47,6 +47,21 @@ pub enum Mode {
         endpoint: String,
         target: String,
     },
+    Client {
+        #[structopt(long, default_value)]
+        client_cert: ClientCert,
+        #[structopt(long, default_value)]
+        client_key: ClientKey,
+        #[structopt(long)]
+        no_client_auth: bool,
+        #[structopt(long, default_value = "10")]
+        keep_alive: u64,
+        #[structopt(long, default_value = "300")]
+        conn_timeout: u64,
+
+        endpoint: String,
+        target: String,
+    },
 }
 
 #[derive(StructOpt, Clone, Debug)]
