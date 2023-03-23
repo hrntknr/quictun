@@ -51,16 +51,6 @@ pub async fn server(
                 endpoint.wait_idle().await;
                 break;
             }
-            Some(res) = set.join_next() => {
-                match res.unwrap() {
-                    Ok(_) => {
-                        debug!("handle_connection closed");
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("failed to handle connection: {}", e));
-                    }
-                }
-            }
         }
     }
 

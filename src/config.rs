@@ -39,6 +39,10 @@ pub enum Mode {
         client_key: ClientKey,
         #[structopt(long)]
         no_client_auth: bool,
+        #[structopt(short = "6")]
+        v6: bool,
+        #[structopt(short = "4")]
+        v4: bool,
         #[structopt(long, default_value = "10")]
         keep_alive: u64,
         #[structopt(long, default_value = "300")]
@@ -54,6 +58,10 @@ pub enum Mode {
         client_key: ClientKey,
         #[structopt(long)]
         no_client_auth: bool,
+        #[structopt(short = "6")]
+        v6: bool,
+        #[structopt(short = "4")]
+        v4: bool,
         #[structopt(long, default_value = "10")]
         keep_alive: u64,
         #[structopt(long, default_value = "300")]
