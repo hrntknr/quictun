@@ -33,13 +33,13 @@ $ sudo systemctl enable --now quictun
 
 ```
 Host *
-  ProxyCommand quictun nc --no-client-auth quic://{server_address}:2222 %h:%p
+  ProxyCommand quictun nc --no-client-auth {server_address}:2222 %h:%p
 ```
 
 ## client mode
 By using client mode, it works similar to the L option of ssh.
 ```
-quictun client quic://{server_address}:2222 8080:localhost:8080
+quictun client {server_address}:2222 8080:localhost:8080
 ```
 
 ## Client Auth

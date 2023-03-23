@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use async_std::net::ToSocketAddrs;
 use std::str::FromStr;
 
 struct SkipServerVerification;
@@ -25,6 +26,8 @@ pub async fn client(
     client_cert: &String,
     client_key: &String,
     no_client_auth: bool,
+    v6: bool,
+    v4: bool,
     keep_alive: u64,
     conn_timeout: u64,
     remote: &String,
@@ -36,6 +39,8 @@ pub async fn client(
         client_cert,
         client_key,
         no_client_auth,
+        v4,
+        v6,
         conn_timeout,
         remote,
     )
@@ -63,34 +68,41 @@ async fn client_init(
     client_cert: &String,
     client_key: &String,
     no_client_auth: bool,
+    v4: bool,
+    v6: bool,
     conn_timeout: u64,
     remote: &String,
 ) -> Result<(std::net::SocketAddr, String, quinn::Endpoint)> {
-    let remote = url::Url::parse(&remote)?;
-    if remote.scheme() != "quic" {
-        return Err(anyhow!("invalid scheme"));
-    }
-    let host = match remote.host_str() {
+    let remote = match remote
+        .to_socket_addrs()
+        .await?
+        .filter(|addr| {
+            if v4 && v6 {
+                return true;
+            }
+            if v4 && addr.is_ipv4() {
+                return true;
+            }
+            if v6 && addr.is_ipv6() {
+                return true;
+            }
+            if !v4 && !v6 {
+                return true;
+            }
+            return false;
+        })
+        .next()
+    {
         Some(v) => v,
         None => {
-            return Err(anyhow!("failed to resolve host"));
-        }
-    };
-    let port = match remote.port() {
-        Some(v) => v,
-        None => {
-            return Err(anyhow!("failed to resolve port"));
+            return Err(anyhow!("failed to resolve remote address"));
         }
     };
 
-    let peer_addr =
-        match std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", host, port))?.next() {
-            Some(v) => v,
-            None => {
-                return Err(anyhow!("failed to resolve peer address"));
-            }
-        };
-    let bind_addr = match peer_addr {
+    let host = remote.ip().to_string();
+    debug!("client: host: {}", host);
+
+    let bind_addr = match remote {
         std::net::SocketAddr::V4(_) => "0.0.0.0:0",
         std::net::SocketAddr::V6(_) => "[::]:0",
     };
@@ -130,7 +142,7 @@ async fn client_init(
     quinn_client_config.transport_config(std::sync::Arc::new(transport_config));
     endpoint.set_default_client_config(quinn_client_config);
 
-    return Ok((peer_addr, host.to_string(), endpoint));
+    return Ok((remote, host, endpoint));
 }
 
 async fn handle_stream_nc(
