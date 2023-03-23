@@ -198,6 +198,8 @@ pub async fn pipe_stream_std(
     let mut quicbuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut basebuf = [0u8; crate::MAX_DATAGRAM_SIZE];
     let mut result = Ok(());
+    let mut stdend = false;
+
     loop {
         tokio::select! {
             _ = conn.closed() => {
@@ -232,12 +234,13 @@ pub async fn pipe_stream_std(
                 basewrite.flush().await?;
             },
 
-            v = baseread.read(&mut basebuf) => {
+            v = baseread.read(&mut basebuf), if !stdend => {
                 let v = match v {
                     Ok(v) => {
                         if v == 0 {
                             debug!("pipe_stream: baseread EOF");
-                            break;
+                            stdend = true;
+                            continue;
                         }
                         v
                     },
