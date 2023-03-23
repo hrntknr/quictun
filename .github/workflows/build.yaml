@@ -1,9 +1,6 @@
 name: Release
 
-on:
-  push:
-    tags:
-      - "*"
+on: push
 
 jobs:
   build:
@@ -58,15 +55,16 @@ jobs:
           args: --release --target ${{ matrix.target }} --verbose
 
       - name: Rename artifact
-        run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} target/${{ matrix.target }}/release/${{ matrix.target }}
+        run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}-${{ matrix.target }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}-${{ matrix.target }}
 
       - name: Release
         uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.target }}
+          files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}-${{ matrix.target }}
