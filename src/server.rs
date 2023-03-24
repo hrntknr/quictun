@@ -38,7 +38,8 @@ pub async fn server(
                 let conn = match conn.await {
                     Ok(c) => c,
                     Err(e) => {
-                        return Err(anyhow!("failed to accept connection: {}", e));
+                        debug!("failed to accept connection: {}", e);
+                        continue
                     }
                 };
                 let target_whitelist = target_whitelist.clone();
